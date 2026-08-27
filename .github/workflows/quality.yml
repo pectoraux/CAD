@@ -1,0 +1,12 @@
+name: quality
+on:
+  push:
+  pull_request:
+
+jobs:
+  spec-governance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Spec integrity
+        run: bash scripts/spec-gate.sh
