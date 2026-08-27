@@ -15,6 +15,13 @@ required=(
   docs/ARCHITECT-MASTER-PROMPT.md
   docs/reviews/ARCHITECT-REVIEW-PROTOCOL.md
   docs/reviews/CHECKPOINT-PROTOCOL.md
+  docs/ARCHITECT-REVIEWER-PROMPT.md
+  docs/reviews/REVIEW-PACKET-TEMPLATE.md
+  docs/reviews/ARCHITECTURE-CHANGE-REQUEST-TEMPLATE.md
+  docs/WORK-ORDER-HANDOFF-PROTOCOL.md
+  spec/traceability.md
+  spec/product-scope.md
+  spec/VERSION-HISTORY.md
 )
 for f in "${required[@]}"; do
   test -s "$f" || { echo "SPEC_GATE_FAIL missing:$f"; exit 1; }
@@ -23,5 +30,7 @@ done
 grep -q 'Status: FROZEN' spec/architecture-lock.md || { echo 'SPEC_GATE_FAIL architecture not frozen'; exit 1; }
 grep -q 'Rust stable' spec/architecture-lock.md || { echo 'SPEC_GATE_FAIL Rust lock missing'; exit 1; }
 grep -q 'GLM 5.3' docs/ARCHITECT-MASTER-PROMPT.md || { echo 'SPEC_GATE_FAIL GLM contract missing'; exit 1; }
+./scripts/verify-work-orders.sh
+./scripts/verify-dependencies.sh
 
 echo 'SPEC_GATE_PASS'

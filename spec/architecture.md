@@ -1,4 +1,4 @@
-# AEC CAD OS Architecture v1.0
+# AEC CAD OS Architecture v1.1
 
 ## 1. System shape
 
@@ -106,3 +106,57 @@ Undo is command-based. A committed mutation records enough deterministic informa
 ## 7. Storage model
 
 The canonical runtime model is in-memory and transactionally mutated. Persistent project/document storage is versioned and schema-controlled. External file import creates an import record and diagnostics. Save/export creates an explicit artifact version.
+
+
+## 8. Authority hierarchy
+
+Authority is ordered, highest first:
+
+1. frozen architecture version and architecture lock;
+2. canonical domain model and command contracts;
+3. requirements and acceptance criteria;
+4. Work Item and its approved Work Order;
+5. implementation code and tests;
+6. agent/reviewer claims.
+
+An implementation may never resolve a conflict by choosing a lower-ranked source.
+
+## 9. Implementation dependency rules
+
+The allowed dependency graph is:
+
+```text
+core-geometry
+    ↓
+core-document
+    ↓
+core-commands
+    ├── core-selection
+    │      ↓
+    │   core-snap
+    ├── core-annotation
+    │      ↓
+    │   core-layout
+    ├── interop-dxf
+    └── interop-dwg
+           ↓
+domain-electrical
+           ↓
+ai-gateway
+```
+
+`app-shell` and `app-ui` may consume public application contracts but may not own domain state or mutate the canonical model directly.
+
+`project-services` is not part of the V1 local authoritative CAD runtime. It may later own cloud/project metadata, synchronization, identity and artifact/version metadata without becoming a second CAD-document authority.
+
+## 10. Authority of persistence
+
+For V1, an open CAD document's canonical state is authoritative in the deterministic core while it is being edited. Exported files are external artifacts. If cloud/project persistence is later enabled, persisted canonical document revisions become the durable source of truth for project recovery, but the editing engine remains the sole mutation authority.
+
+## 11. Reproducibility
+
+A deterministic command execution is a pure function of:
+
+`document_revision + command_version + canonical_input + active_rule_profile + deterministic_seed`
+
+No wall-clock time, locale, hash-map iteration order, provider output, network response or random value may affect a committed CAD result unless it is explicitly captured in the command input and versioned.

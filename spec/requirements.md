@@ -1,4 +1,4 @@
-# Requirements v1.0
+# Requirements v1.1
 
 ## Product requirements
 
@@ -59,3 +59,14 @@ Implementation agents shall not alter frozen architecture without escalation.
 ## Acceptance criteria families
 
 Every Work Item must reference one or more of: geometry correctness, command determinism, visual regression, interoperability corpus, electrical graph integrity, security/permission correctness, or performance evidence.
+
+
+## V1 product boundary
+
+V1 is a desktop-first professional 2D electrical CAD application. V1 includes the high-frequency generic drafting loop, production documentation, electrical project semantics, deterministic automation, progressive DWG/DXF compatibility, and typed AI planning described by this architecture.
+
+V1 explicitly excludes: full 3D mechanical CAD, full BIM, Revit/ArchiCAD parity, SolidWorks parity, full AutoLISP/ObjectARX compatibility, full DGN semantics, circuit simulation, thermal simulation, CAM, and broad cloud collaboration as a replacement for the local deterministic editing core.
+
+## Acceptance evidence policy
+
+A requirement is not considered satisfied by UI presence or command registration alone. The required semantic behavior must be demonstrated through the evidence class in `spec/traceability.md` and the applicable checkpoint protocol.

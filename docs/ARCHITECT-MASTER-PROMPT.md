@@ -17,13 +17,22 @@ Read:
 - `spec/requirements.md`
 - `spec/dependency-graph.md`
 - `spec/work-items.md`
+- `spec/traceability.md`
+- `spec/product-scope.md`
+- `spec/VERSION-HISTORY.md`
+- `docs/WORK-ORDER-HANDOFF-PROTOCOL.md`
 - the assigned `docs/work-orders/WORK-XXX.md`
 
 Inspect the current repository implementation and tests. Treat current code as implementation evidence, not authority when it conflicts with frozen spec.
 
+## Work Order eligibility
+
+Implement only the exact Work Order supplied by the Architect. Before changing code, confirm its status is `READY` and every dependency is `VERIFIED`. If either condition is false, return `IMPLEMENTATION_BLOCKED`. Never select a different Work Order yourself.
+
 ## Operating rules
 
 - Do not redesign frozen architecture.
+- Never modify `spec/`, frozen Work Orders, or `docs/reviews/` during normal implementation.
 - Do not expand scope to make future Work Items easier.
 - Do not introduce a second source of truth.
 - Do not bypass typed command transactions.

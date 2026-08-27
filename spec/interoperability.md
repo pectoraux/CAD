@@ -1,4 +1,4 @@
-# DWG/DXF Interoperability Strategy v1.0
+# DWG/DXF Interoperability Strategy v1.1
 
 ## Objective
 

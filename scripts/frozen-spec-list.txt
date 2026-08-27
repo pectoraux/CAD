@@ -38,3 +38,10 @@ docs/work-orders/WORK-023.md
 docs/work-orders/WORK-024.md
 docs/work-orders/WORK-025.md
 docs/work-orders/WORK-026.md
+spec/traceability.md
+spec/product-scope.md
+docs/ARCHITECT-REVIEWER-PROMPT.md
+docs/reviews/REVIEW-PACKET-TEMPLATE.md
+docs/reviews/ARCHITECTURE-CHANGE-REQUEST-TEMPLATE.md
+docs/WORK-ORDER-HANDOFF-PROTOCOL.md
+spec/VERSION-HISTORY.md

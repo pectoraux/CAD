@@ -1,7 +1,7 @@
 # WORK-008 — Annotation and Styles
 
 Status: BLOCKED-BY-W003,W006
-Architecture: v1.0 frozen
+Architecture: v1.1 frozen
 Dependencies: WORK-003, WORK-006
 Checkpoint: CP3
 
@@ -9,7 +9,60 @@ Checkpoint: CP3
 Implement production annotation: TEXT, MTEXT, dimensions, leaders, multileaders, hatches, text styles and dimension styles.
 
 ## Acceptance criteria
-- Canonical annotation objects are renderer-independent.
-- Style references are explicit.
-- Deterministic geometry/placement tests exist.
-- Text/dimension rendering has visual regression fixtures.
+- WO-008-AC01 — Canonical annotation objects are renderer-independent.
+- WO-008-AC02 — Style references are explicit.
+- WO-008-AC03 — Deterministic geometry/placement tests exist.
+- WO-008-AC04 — Text/dimension rendering has visual regression fixtures.
+
+## Identity
+
+- Work Order: `WORK-008`
+- Architecture version: `v1.1`
+
+## Allowed changes
+
+crates/core-annotation. Changes outside these areas require Architect approval before implementation.
+
+## Required implementation
+
+Implement only the behavior stated in this Work Order together with the referenced frozen contracts. Use existing public interfaces and preserve ownership boundaries. Do not invent unspecified semantics.
+
+## Forbidden changes
+
+Do not modify frozen specification authority or introduce: layout, interop, UI, electrical. Do not edit another Work Order to make this implementation pass.
+
+## Required tests/evidence
+
+- Unit tests for all new deterministic behavior.
+- Property/fuzz tests for geometry or binary parsing where applicable.
+- Integration tests for cross-module behavior where applicable.
+- Regression fixtures for every discovered edge case.
+- Architecture/static checks proving forbidden dependencies are absent.
+- Evidence identifiers must map to this Work Order's acceptance criteria in `spec/traceability.md`.
+
+## Scope boundary
+
+Later Work Orders remain out of scope even when their code would be convenient to add now. A future-facing abstraction is allowed only when required by this Work Order and explicitly documented without implementing future behavior.
+
+## Stop conditions
+
+Stop and report `ARCHITECTURE_CHANGE_REQUIRED` for a frozen semantic gap, new authority, new command/entity/state, dependency-boundary change, proprietary hard dependency, or weakened correctness/data-loss guarantee. Report `IMPLEMENTATION_BLOCKED` when a prerequisite is missing or the repository baseline is inconsistent.
+
+## Definition of done
+
+All acceptance criteria pass with concrete evidence; no out-of-scope code exists; required checks are green; the branch is ready for independent Architect Review.
+
+## Final response
+
+```text
+WORK-008 COMPLETE
+
+Implementation summary:
+Files changed:
+Acceptance evidence:
+Architecture invariants checked:
+Tests/CI:
+Known limitations:
+Out-of-scope work intentionally not implemented:
+Any blockers:
+```

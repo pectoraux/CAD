@@ -1,4 +1,4 @@
-# Canonical Domain Model v1.0
+# Canonical Domain Model v1.1
 
 All IDs are opaque, globally unique within their type and never reused. The preferred wire form is UUIDv7 or an equivalent sortable random identifier. Handles originating from external formats are preserved separately and never reused as primary IDs.
 
@@ -8,7 +8,7 @@ All IDs are opaque, globally unique within their type and never reused. The pref
 ProjectId
 DrawingId
 EntityId
-ObjectId
+ExternalObjectId
 LayerId
 BlockDefinitionId
 BlockReferenceId
@@ -30,6 +30,70 @@ CommandId
 TransactionId
 ArtifactVersionId
 ```
+
+## Core value types and invariants
+
+All coordinates use IEEE-754 `f64` at the API boundary and a single document unit system. Geometry predicates that require robust classification MUST use an explicit tolerance policy; tolerance is never implicit or caller-chosen on a per-operation basis.
+
+### `Project`
+
+- `id: ProjectId`
+- `name: string`
+- `description: string | null`
+- `status: ACTIVE | ARCHIVED`
+- `created_at`
+- `updated_at`
+
+A Project owns Drawings and optional ElectricalProject configuration. `ElectricalProject` is a capability/configuration aggregate, not a second Project identity.
+
+### `DrawingRevision`
+
+- `id: ArtifactVersionId`
+- `drawing_id: DrawingId`
+- `revision_number: u64`
+- `content_hash`
+- `created_at`
+- `parent_revision_id | null`
+
+A document revision is immutable. Commands advance revision exactly once on successful mutation.
+
+### `Units`
+
+`UnitSystem = MetricMM | MetricCM | MetricM | ImperialIn | ImperialFt`
+
+Conversion is deterministic and loss-aware; the canonical drawing stores one declared unit system.
+
+
+## Closed value types
+
+```text
+VisibilityState = Visible | Hidden
+SpaceRef = ModelSpace | Layout(LayoutId)
+SourceKind = Xref | Image | PdfUnderlay | DgnUnderlay | Other
+PreservationStatus = PreservedOpaque | RenderedOpaque | DegradedOpaque | NotPreserved
+ProvenanceKind = Imported | Created | Derived | AIPlanned
+TerminalDirection = Input | Output | Bidirectional | Passive
+ConnectionStatus = Connected | Unresolved | Invalid
+DrawingUnits = MetricMM | MetricCM | MetricM | ImperialIn | ImperialFt
+PaperOrientation = Portrait | Landscape
+
+Provenance { kind, source_artifact_hash: string | null, source_revision: string | null, source_handle: string | null }
+StyleRef { style_id: StyleId }
+Transform2D { translation: Vector2, rotation_rad: f64, scale_x: f64, scale_y: f64 }
+RatingSet = map<string, string> with canonical sorted keys
+
+Unknown/extra fields are forbidden in canonical persisted DTOs.
+```
+
+`f64` values must be finite. NaN and infinities are rejected at every canonical-model boundary.
+
+### Styles
+
+`Style` and `DimensionStyle` are first-class drawing-owned objects. A style has a stable ID and version; entity references contain IDs only. Style mutation is a command and is revisioned.
+
+### Report query
+
+`ReportDefinition.query` is a closed declarative query AST over the canonical electrical graph. It is never SQL, shell text, JavaScript, or arbitrary executable code.
 
 ## Generic CAD entities
 
@@ -54,8 +118,8 @@ Specializations for V1:
 - `id`
 - `project_id`
 - `name`
-- `units`
-- `model_space_root`
+- `units: DrawingUnits`
+- `model_space_root: EntityId | null`
 - `layouts[]`
 - `layers[]`
 - `linetypes[]`
@@ -64,6 +128,9 @@ Specializations for V1:
 - `blocks[]`
 - `external_refs[]`
 - `metadata`
+- `active_layer_id: LayerId`
+- `current_space: SpaceRef`
+- `revision: u64`
 
 ### `Layer`
 
@@ -250,6 +317,17 @@ Invariant: opaque objects can never silently disappear during an otherwise succe
 - `sorting[]`
 - `formatting`
 
+## Representation and reference invariants
+
+1. Every entity has exactly one owning drawing and at most one owning block definition.
+2. Every block reference points to exactly one existing block definition.
+3. A block definition cannot directly contain a block reference cycle.
+4. Every layout belongs to exactly one drawing.
+5. A viewport belongs to exactly one layout.
+6. External references are metadata/links; their resolved content is never silently merged into the host drawing.
+7. Opaque external objects retain their original handle/ownership metadata independently of canonical IDs.
+8. Provenance records distinguish `Imported | Created | Derived | AIPlanned` and retain source artifact/revision where available.
+
 ## Relationship invariants
 
 1. Every `Component` belongs to exactly one electrical project.
@@ -262,3 +340,7 @@ Invariant: opaque objects can never silently disappear during an otherwise succe
 8. Catalog assignment is metadata and does not define geometry ownership.
 9. Generic entities may exist without electrical meaning.
 10. Electrical semantics may reference generic entities; generic entities must not import electrical modules.
+11. `ElectricalProject.project_id` references `Project.id`; no independent project identity is created.
+12. `Component.source_entity_id`, representation entity IDs and wire geometry entity IDs must reference entities in drawings belonging to the same Project.
+13. No command may leave dangling references after commit.
+14. All persisted enum/state values are closed sets defined by this specification; unknown values are rejected at the canonical-model boundary.

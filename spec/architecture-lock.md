@@ -1,4 +1,4 @@
-# Architecture Lock v1.0
+# Architecture Lock v1.1
 
 **Status: FROZEN**
 
@@ -44,3 +44,24 @@ An implementation agent must stop and report `ARCHITECTURE_CHANGE_REQUIRED` when
 - weakening round-trip/data-loss guarantees;
 - moving electrical semantics into the generic CAD core;
 - introducing a proprietary CAD SDK as a hard dependency.
+
+
+## Pre-implementation freeze correction policy
+
+This repository is a specification baseline. Before the first implementation PR is merged, any discovered defect in the frozen v1.0 documents must be resolved by publishing v1.1 as the superseding frozen architecture version; v1.0 remains immutable historical record. After v1.1 is accepted, implementation agents may not alter any frozen file.
+
+## LLM implementation constraints
+
+An implementation agent:
+
+- may read all repository files;
+- may modify only files allowed by its assigned Work Order;
+- must not modify `spec/`, `docs/reviews/`, or another Work Order while implementing a normal Work Order;
+- must not change acceptance criteria, dependencies, checkpoint assignments, authority rules or command semantics;
+- must not add a new command/entity/state merely to make an implementation easier;
+- must stop on unresolved semantic ambiguity rather than inventing behavior;
+- must produce machine-checkable evidence before claiming completion.
+
+## Reviewer independence
+
+The architect/reviewer may reject implementation even when all tests pass. Passing tests do not override scope, architecture, compatibility, data-integrity or semantic defects.
