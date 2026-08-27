@@ -2,9 +2,9 @@
 
 ## What we are adopting
 
-WorkflowOS's frozen architecture establishes a strong governance pattern: architecture is frozen; work is decomposed into dependent Work Items; execution agents do not own workflow state; evidence is required for completion; architectural changes require an explicit change request; Work Orders contain explicit scope, acceptance criteria, stop conditions and a definition of done. fileciteturn12file0
+WorkflowOS's frozen architecture establishes a strong governance pattern: architecture is frozen; work is decomposed into dependent Work Items; execution agents do not own workflow state; evidence is required for completion; architectural changes require an explicit change request; Work Orders contain explicit scope, acceptance criteria, stop conditions and a definition of done. (source: https://github.com/pectoraux/WorkflowOS/blob/main/spec/architecture-lock.md)
 
-Its actual Z.ai Work Order pattern reinforces this: the agent is instructed to read the frozen specification before code changes, not redesign the architecture, operate within explicit module boundaries, provide concrete test/evidence output, and escalate architectural blockers instead of inventing alternate designs. fileciteturn9file0
+Its actual Z.ai Work Order pattern reinforces this: the agent is instructed to read the frozen specification before code changes, not redesign the architecture, operate within explicit module boundaries, provide concrete test/evidence output, and escalate architectural blockers instead of inventing alternate designs. (source: https://github.com/pectoraux/WorkflowOS/blob/main/docs/work-items/WORK-004-zai-prompt.md)
 
 ## What we keep
 
