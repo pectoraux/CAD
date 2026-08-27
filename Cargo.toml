@@ -1,0 +1,27 @@
+[workspace]
+members = [
+  "crates/core-geometry",
+  "crates/core-document",
+  "crates/core-commands",
+  "crates/core-selection",
+  "crates/core-snap",
+  "crates/core-annotation",
+  "crates/core-layout",
+  "crates/interop-dxf",
+  "crates/interop-dwg",
+  "crates/domain-electrical",
+  "crates/ai-gateway",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+license = "LicenseRef-Proprietary"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
