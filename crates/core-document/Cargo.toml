@@ -8,5 +8,24 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[dependencies]
+# WO-003-AC04 — Generic CAD modules do not import electrical modules.
+# Per `spec/architecture.md` §9 "Implementation dependency rules", the
+# only `aeccad-*` dependency permitted for `core-document` is
+# `core-geometry` (its parent in the dependency DAG). Any other
+# `aeccad-*` crate would be a frozen-architecture violation; the
+# `verify-architecture-dependencies.sh` baseline sub-gate enforces this
+# statically at PR time, and `lib.rs::no_aeccad_*_dependencies_*` tests
+# enforce it in-unit-test as well.
+aeccad-core-geometry = { path = "../core-geometry" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+# serde_json is a TEST-ONLY dependency. It exists solely to exercise
+# `Serialize`/`Deserialize` round-trips in the test suite (WO-003-AC02
+# evidence). It never ships in the document runtime — there is no
+# file-format dependency entering the canonical document model.
+serde_json = "1"
+
 [lints]
 workspace = true
