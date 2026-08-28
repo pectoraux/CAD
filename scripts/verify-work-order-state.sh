@@ -55,8 +55,14 @@ if active is not None:
     if missing:
         raise SystemExit(f"WORK_ORDER_STATE_GATE_FAIL {active} has unverified dependencies: {sorted(missing)}")
     cp = checkpoints[active]
-    if checkpoint_state.get(cp) != "OPEN":
-        raise SystemExit(f"WORK_ORDER_STATE_GATE_FAIL {active} checkpoint {cp} is not OPEN")
+    # An active Work Order may sit on a checkpoint that is OPEN (work not
+    # yet started) or PASSED (the checkpoint was already passed by an
+    # earlier Work Order on the same checkpoint — e.g. W003 sits on CP1,
+    # which W002 already passed). Rejecting PASSED here would block every
+    # second-or-later item on a shared checkpoint. Mirrors the verified
+    # rule above.
+    if checkpoint_state.get(cp) not in {"OPEN", "PASSED"}:
+        raise SystemExit(f"WORK_ORDER_STATE_GATE_FAIL {active} checkpoint {cp} is not OPEN/PASSED")
 
 ready = []
 for i in range(1, 27):
