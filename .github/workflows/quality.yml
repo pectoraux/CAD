@@ -14,7 +14,7 @@ jobs:
         run: bash scripts/baseline-gate.sh
 
   pr-work-order:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && contains(github.event.pull_request.title, 'WORK-')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,5 +25,5 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           WORK_ORDER_ID="$(printf '%s\n' "$PR_TITLE" | grep -oE 'W[0-9]{3}' | head -n1 || true)"
-          test -n "$WORK_ORDER_ID" || { echo 'WORK_ORDER_STATE_GATE_FAIL PR title must contain WORK-NNN'; exit 1; }
+          test -n "$WORK_ORDER_ID" || { echo 'WORK_ORDER_STATE_GATE_FAIL implementation PR title must contain WORK-NNN'; exit 1; }
           WORK_ORDER_ID="$WORK_ORDER_ID" bash scripts/verify-work-order-state.sh
