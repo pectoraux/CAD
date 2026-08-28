@@ -6,7 +6,7 @@
   "checkpoints": {
     "CP0": "PASSED",
     "CP1": "PASSED",
-    "CP2": "OPEN",
+    "CP2": "BLOCKED",
     "CP3": "BLOCKED",
     "CP4": "BLOCKED",
     "CP5": "BLOCKED",
