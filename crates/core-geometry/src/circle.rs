@@ -473,20 +473,59 @@ impl Arc2 {
     }
 
     /// Returns `true` if `angle` lies within the arc's angular range.
+    ///
+    /// The arc is treated as a *closed* interval: both the start angle
+    /// (`start_angle`) and the end angle (`start_angle + sweep_angle`)
+    /// are contained, as is every angle strictly between them in the
+    /// sweep direction.
+    ///
+    /// This is a geometry classification predicate, so per the frozen
+    /// v1.1 contract it uses [`Tolerance::CANONICAL`](crate::tolerance::Tolerance)
+    /// internally at the angular boundary. The tolerance absorbs
+    /// floating-point noise at the boundary — e.g. an intersection
+    /// point computed at the arc's start via `atan2` may carry an
+    /// ULP-scale residual that an exact `==` comparison would reject.
+    /// Angles farther than `Tolerance::CANONICAL` from the arc are
+    /// classified as outside.
+    ///
+    /// For a clockwise arc (`sweep_angle < 0`), the angular range wraps
+    /// around the `2π` boundary: in relative coordinates (modulo `2π`,
+    /// normalized into `[0, 2π)`) it is the set `{0} ∪ [2π + sweep, 2π)`,
+    /// where `0` is the start and `2π + sweep` is the end.
     #[must_use]
     pub fn contains_angle(&self, angle: f64) -> bool {
         let two_pi = 2.0 * std::f64::consts::PI;
-        // Normalize relative angle into [0, |sweep|].
-        let mut rel = (angle - self.start_angle).rem_euclid(two_pi);
+        // Relative angle, normalized into [0, 2π) — independent of the
+        // sweep sign so the two branches below share one representation.
+        let rel = (angle - self.start_angle).rem_euclid(two_pi);
+        let tol = Tolerance::CANONICAL.absolute();
         if self.sweep_angle < 0.0 {
-            // CW arc: angles in (sweep, 0] (modulo 2π).
-            rel = two_pi - rel;
-            if rel > -self.sweep_angle {
-                return false;
-            }
-            return true;
+            // CW arc: spans [sweep_angle, 0] in relative terms. After
+            // mod-2π normalization into [0, 2π) that interval maps to
+            // `{0} ∪ [2π + sweep_angle, 2π)`. Both endpoints are
+            // inclusive: `rel` near 0 is the start, `rel` near
+            // `end_rel == 2π + sweep_angle` is the end. `sweep_angle ∈
+            // (-2π, 0)` after `normalize_sweep`, so `end_rel ∈ (0, 2π)`
+            // and the start/end bands never collapse into each other
+            // for a non-degenerate arc.
+            let end_rel = two_pi + self.sweep_angle;
+            // Start band (rel ≤ tol) catches the start whether atan2
+            // yields exactly 0 or a tiny ±ULP residual that wraps to
+            // either side of 0. End band (rel ≥ end_rel − tol) catches
+            // the end including ULP-scale undershoot from
+            // `(start + sweep) − start` not rounding exactly to sweep.
+            rel <= tol || rel >= end_rel - tol
+        } else {
+            // CCW arc: spans [0, sweep_angle] in relative terms
+            // (inclusive). `sweep_angle ∈ (0, 2π]` after normalization;
+            // for the full-circle case (`sweep == 2π`) every rel in
+            // [0, 2π) satisfies `rel <= 2π + tol`.
+            //
+            // Start band (rel ≥ 2π − tol) catches the start when atan2
+            // undershoots into `2π − ε`; end band (rel ≤ sweep + tol)
+            // catches the end including ULP-scale overshoot.
+            rel <= self.sweep_angle + tol || rel >= two_pi - tol
         }
-        rel <= self.sweep_angle
     }
 
     /// Closest point on the arc curve to `p`. Projects to the underlying
@@ -991,5 +1030,228 @@ mod tests {
             radius: 0.0,
         };
         assert!(bad.validate().is_err());
+    }
+
+    // ---- Clockwise Arc2 angular-containment regressions ----
+    // Evidence: WO-002 deterministic-geometry correctness — `contains_angle`
+    // previously excluded the start angle for any clockwise (negative-sweep)
+    // arc, breaking bounding boxes, project_point endpoint selection, and
+    // arc/line & arc/circle intersection-at-start filtering.
+
+    #[test]
+    fn arc_cw_contains_start_angle() {
+        // Regression: clockwise arc must include its start angle.
+        // The previous impl reflected rel==0 to 2π, which always exceeded
+        // |sweep|, so the start was excluded.
+        let a = Arc2::new(Point2::ORIGIN, 1.0, 0.0, -std::f64::consts::FRAC_PI_2).unwrap();
+        assert!(
+            a.contains_angle(0.0),
+            "cardinal start angle must be contained"
+        );
+        // Non-cardinal start to rule out a `0.0`-only patch:
+        let b = Arc2::new(Point2::ORIGIN, 1.0, 1.0, -std::f64::consts::FRAC_PI_2).unwrap();
+        assert!(
+            b.contains_angle(1.0),
+            "non-cardinal start angle must be contained"
+        );
+        // Start expressed as start + 2π (same direction) must also be contained:
+        assert!(a.contains_angle(2.0 * std::f64::consts::PI));
+    }
+
+    #[test]
+    fn arc_cw_contains_end_angle() {
+        // Regression: clockwise arc must include its end angle.
+        let a = Arc2::new(Point2::ORIGIN, 1.0, 0.0, -std::f64::consts::FRAC_PI_2).unwrap();
+        assert!(
+            a.contains_angle(-std::f64::consts::FRAC_PI_2),
+            "end angle (negative form) must be contained"
+        );
+        assert!(
+            a.contains_angle(a.end_angle()),
+            "end_angle() return value must be contained"
+        );
+        // End expressed as the positive-mod equivalent (3π/2) must also be contained:
+        assert!(a.contains_angle(3.0 * std::f64::consts::FRAC_PI_2));
+    }
+
+    #[test]
+    fn arc_cw_contains_interior_angles() {
+        // Regression: interior clockwise angles are contained.
+        let a = Arc2::new(Point2::ORIGIN, 1.0, 0.0, -std::f64::consts::FRAC_PI_2).unwrap();
+        // Sweep covers the 4th quadrant (0 → -π/2). Interior angles:
+        assert!(a.contains_angle(-std::f64::consts::FRAC_PI_4));
+        assert!(a.contains_angle(-std::f64::consts::FRAC_PI_6));
+        assert!(a.contains_angle(-1.0));
+        // The same interior angles expressed as positive values in [0, 2π):
+        assert!(a.contains_angle(2.0 * std::f64::consts::PI - std::f64::consts::FRAC_PI_4));
+        assert!(a.contains_angle(2.0 * std::f64::consts::PI - std::f64::consts::FRAC_PI_2));
+    }
+
+    #[test]
+    fn arc_cw_excludes_just_outside() {
+        // Regression: angles just outside the sweep are excluded.
+        let a = Arc2::new(Point2::ORIGIN, 1.0, 0.0, -std::f64::consts::FRAC_PI_2).unwrap();
+        // Just past start going CCW (outside the arc):
+        assert!(
+            !a.contains_angle(1e-6),
+            "angle just past start CCW must be excluded"
+        );
+        // Just past end going CW (outside the arc):
+        assert!(
+            !a.contains_angle(-std::f64::consts::FRAC_PI_2 - 1e-6),
+            "angle just past end CW must be excluded"
+        );
+        // Clearly outside (opposite side of the circle):
+        assert!(!a.contains_angle(std::f64::consts::PI));
+        assert!(!a.contains_angle(std::f64::consts::FRAC_PI_2));
+    }
+
+    #[test]
+    fn arc_cw_bounding_box_includes_extremes() {
+        // Regression: clockwise arc bounding box must include both
+        // endpoints and any in-range cardinal extreme. The arc covers
+        // the 4th quadrant (angle 0 → -π/2): x_max = r at the start,
+        // y_min = -r at the end, with no interior cardinal extrema.
+        let a = Arc2::new(Point2::ORIGIN, 2.0, 0.0, -std::f64::consts::FRAC_PI_2).unwrap();
+        let b = a.bounding_box();
+        assert!(
+            approx(b.max.x, 2.0),
+            "BB must reach start point x=r, got {}",
+            b.max.x
+        );
+        assert!(
+            approx(b.min.x, 0.0),
+            "BB min.x should be 0, got {}",
+            b.min.x
+        );
+        assert!(
+            approx(b.min.y, -2.0),
+            "BB must reach end point y=-r, got {}",
+            b.min.y
+        );
+        assert!(
+            approx(b.max.y, 0.0),
+            "BB max.y should be 0, got {}",
+            b.max.y
+        );
+        // Explicit containment checks for the endpoints:
+        assert!(b.contains(&a.start_point()), "BB must contain start point");
+        assert!(b.contains(&a.end_point()), "BB must contain end point");
+        // And a CW arc that crosses a cardinal interior to the sweep:
+        let c = Arc2::new(
+            Point2::ORIGIN,
+            2.0,
+            std::f64::consts::FRAC_PI_4,
+            -std::f64::consts::FRAC_PI_2,
+        )
+        .unwrap();
+        // start π/4 → end -π/4, crossing angle 0 (point (r,0)) = x_max.
+        let cb = c.bounding_box();
+        assert!(
+            approx(cb.max.x, 2.0),
+            "CW arc crossing 0 must reach x=r, got {}",
+            cb.max.x
+        );
+    }
+
+    #[test]
+    fn arc_cw_line_intersection_at_start_kept() {
+        // Regression: a line that hits the arc exactly at its start point
+        // must NOT be filtered out. Previously contains_angle(start_angle)
+        // returned false for CW arcs, so the start-point intersection was
+        // silently dropped (Intersection2::Empty instead of Point(start)).
+        let a = Arc2::new(Point2::ORIGIN, 1.0, 0.0, -std::f64::consts::FRAC_PI_2).unwrap();
+        // Horizontal line y=0 through the center intersects the underlying
+        // circle at (1,0) [the arc start, angle 0] and (-1,0) [angle π,
+        // outside the CW arc]. Only (1,0) must survive the filter.
+        let l = Line2::from_two_points(
+            Point2::new(-2.0, 0.0).unwrap(),
+            Point2::new(2.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        match a.intersect(&l) {
+            Intersection2::Point(p) => {
+                assert!(
+                    approx(p.x, 1.0),
+                    "start-point hit must survive filter, got x={}",
+                    p.x
+                );
+                assert!(approx(p.y, 0.0));
+            }
+            other => panic!("expected Point((1,0)) at arc start, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arc_cw_circle_intersection_at_start_kept() {
+        // Regression: same as above for arc-circle intersection.
+        // Unit circle at origin ∩ circle centered (1,1) r=1 ⟹ {(1,0), (0,1)}.
+        // For the CW arc (4th quadrant), (1,0) is the start (must be kept)
+        // and (0,1) is angle π/2 (outside, filtered). Only (1,0) survives.
+        let a = Arc2::new(Point2::ORIGIN, 1.0, 0.0, -std::f64::consts::FRAC_PI_2).unwrap();
+        let c = Circle2::new(Point2::new(1.0, 1.0).unwrap(), 1.0).unwrap();
+        match a.intersect(&c) {
+            Intersection2::Point(p) => {
+                assert!(
+                    approx(p.x, 1.0),
+                    "start-point hit must survive filter, got x={}",
+                    p.x
+                );
+                assert!(approx(p.y, 0.0));
+            }
+            other => panic!("expected Point((1,0)) at arc start, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arc_ccw_contains_endpoints_and_interior_control() {
+        // Control: CCW arc containment is unchanged by the CW fix —
+        // both endpoints and the interior are contained, exterior is not.
+        let a = Arc2::new(Point2::ORIGIN, 1.0, 0.0, std::f64::consts::FRAC_PI_2).unwrap();
+        assert!(a.contains_angle(0.0), "start");
+        assert!(a.contains_angle(std::f64::consts::FRAC_PI_2), "end");
+        assert!(a.contains_angle(std::f64::consts::FRAC_PI_4), "interior");
+        assert!(!a.contains_angle(-1e-6), "just before start excluded");
+        assert!(
+            !a.contains_angle(std::f64::consts::FRAC_PI_2 + 1e-6),
+            "just past end excluded"
+        );
+        assert!(!a.contains_angle(std::f64::consts::PI), "opposite excluded");
+    }
+
+    #[test]
+    fn arc_cw_contains_angle_property() {
+        // Property: for any CW arc, the start, end, and sweep midpoint are
+        // always contained; the opposite hemisphere (start + π) is always
+        // excluded when |sweep| < π. Exercises non-cardinal start angles
+        // and non-cardinal sweeps via the test PRNG.
+        let mut p = Prng::new();
+        for _ in 0..256 {
+            let start = p.signed_f64(std::f64::consts::PI);
+            // Sweep magnitude strictly in (0, π) — non-degenerate, CW.
+            let mag = p.range_f64(1e-3, std::f64::consts::PI - 1e-3);
+            let sweep = -mag;
+            let a = Arc2::new(Point2::ORIGIN, 1.0, start, sweep).unwrap();
+            assert!(
+                a.contains_angle(start),
+                "start must be contained (start={start})"
+            );
+            assert!(
+                a.contains_angle(a.end_angle()),
+                "end must be contained (start={start})"
+            );
+            // Interior midpoint = start + sweep/2 (in the sweep direction).
+            let mid = start + sweep * 0.5;
+            assert!(
+                a.contains_angle(mid),
+                "midpoint must be contained (start={start})"
+            );
+            // Opposite hemisphere: start + π (mod 2π) — outside for |sweep|<π.
+            let opposite = start + std::f64::consts::PI;
+            assert!(
+                !a.contains_angle(opposite),
+                "opposite must be excluded (start={start})"
+            );
+        }
     }
 }
