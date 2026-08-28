@@ -11,6 +11,7 @@
 use crate::error::GeometryError;
 use crate::ops::{Transformable2, Validate};
 use crate::point::Point2;
+use crate::tolerance::Tolerance;
 use crate::vector::Vector2;
 use serde::{Deserialize, Serialize};
 
@@ -139,51 +140,82 @@ impl Transform2D {
 
     /// Compose two transforms: result applies `rhs` first, then `self`.
     ///
-    /// i.e. `(self ∘ rhs).apply_point(p) == self.apply_point(rhs.apply_point(p))`.
-    #[must_use]
-    pub fn compose(&self, rhs: &Self) -> Self {
-        // Linear map of combined transform: T = R_s S_s * R_r S_r (no shared
-        // translation). Since rotation+scale is a 2x2 matrix M = R*S, and the
-        // combined transform on a point p is:
-        //   self.apply(rhs.apply(p)) = self.translation + M_s * (rhs.translation + M_r * p)
-        //                            = (self.translation + M_s * rhs.translation) + (M_s * M_r) * p
-        // We re-decompose M = M_s * M_r back into (rotation, scale_x, scale_y).
-        // For a 2x2 matrix M = [[a, b], [c, d]], if det != 0 we can polar
-        // decompose as M = R(theta) * S where S is symmetric. This is not
-        // unique for non-uniform scale + non-zero rotation; the cleanest
-        // canonical choice is to extract rotation from the column vectors.
-        //
-        // Approach: take the first column of M as the image of (1,0). Its
-        // angle is the new rotation; its length is scale_x. Then take the
-        // second column, project out the rotation, the residual length is
-        // scale_y. This is well-defined when det(M) != 0 (i.e. neither scale
-        // is zero).
-        let a = self.scale_x * self.rotation_rad.cos();
-        let b = self.scale_y * self.rotation_rad.sin();
-        let c = self.scale_x * self.rotation_rad.sin();
-        let d = self.scale_y * self.rotation_rad.cos();
-        // M_s = [[a, b], [c, d]]
-        let ra = rhs.scale_x * rhs.rotation_rad.cos();
-        let rb = rhs.scale_y * rhs.rotation_rad.sin();
-        let rc = rhs.scale_x * rhs.rotation_rad.sin();
-        let rd = rhs.scale_y * rhs.rotation_rad.cos();
-        // M_r = [[ra, rb], [rc, rd]]
-        // M = M_s * M_r:
-        let m00 = a * ra + b * rc;
-        let m01 = a * rb + b * rd;
-        let m10 = c * ra + d * rc;
-        let m11 = c * rb + d * rd;
-        let new_rotation_rad = m10.atan2(m00);
-        let new_scale_x = (m00 * m00 + m10 * m10).sqrt();
-        let new_scale_y = (m01 * m01 + m11 * m11).sqrt();
-        // New translation: self.translation + M_s * rhs.translation
-        let t = self.apply_vector(&rhs.translation).add(self.translation);
-        Self {
-            translation: t,
-            rotation_rad: new_rotation_rad,
+    /// i.e. `(self ∘ rhs).apply_point(p) == self.apply_point(rhs.apply_point(p))`
+    /// when the composition is representable in the frozen `R·diag` form.
+    ///
+    /// Returns `Err(GeometryError::Degenerate(_))` when the composition
+    /// produces shear that the frozen `Transform2D` representation
+    /// (`R(rotation)·diag(scale_x, scale_y) + translation`) cannot express.
+    /// This occurs when `self` has non-uniform scale (`scale_x != scale_y`)
+    /// and `rhs` has a rotation that is not a multiple of π/2. The
+    /// frozen-contract-respecting choice is to reject rather than silently
+    /// approximate (WO-002-AC02 determinism / explicit representability).
+    ///
+    /// The `tol` policy governs the orthogonality test on the composed
+    /// matrix's columns. It is explicit per the frozen v1.1 contract.
+    pub fn compose(&self, rhs: &Self, tol: Tolerance) -> Result<Self, GeometryError> {
+        // Linear map of self: M_s = R(phi_s) * diag(sx_s, sy_s).
+        // Columns of M_s: (sx_s*cos, sx_s*sin) and (-sy_s*sin, sy_s*cos).
+        let (sa, sb) = (self.rotation_rad.sin(), self.rotation_rad.cos());
+        let s_m00 = self.scale_x * sb;
+        let s_m01 = -self.scale_y * sa;
+        let s_m10 = self.scale_x * sa;
+        let s_m11 = self.scale_y * sb;
+        // Linear map of rhs: M_r = R(phi_r) * diag(sx_r, sy_r).
+        let (ra, rb) = (rhs.rotation_rad.sin(), rhs.rotation_rad.cos());
+        let r_m00 = rhs.scale_x * rb;
+        let r_m01 = -rhs.scale_y * ra;
+        let r_m10 = rhs.scale_x * ra;
+        let r_m11 = rhs.scale_y * rb;
+        // M = M_s * M_r
+        let m00 = s_m00 * r_m00 + s_m01 * r_m10;
+        let m01 = s_m00 * r_m01 + s_m01 * r_m11;
+        let m10 = s_m10 * r_m00 + s_m11 * r_m10;
+        let m11 = s_m10 * r_m01 + s_m11 * r_m11;
+        // New translation: self.translation + M_s * rhs.translation.
+        let new_translation = self.apply_vector(&rhs.translation).add(self.translation);
+        // Orthogonality test on M's columns. The frozen R*diag form has
+        // orthogonal columns; shear (non-orthogonal columns) is unrepresentable.
+        let col1_len_sq = m00 * m00 + m10 * m10;
+        let col2_len_sq = m01 * m01 + m11 * m11;
+        let dot = m00 * m01 + m10 * m11;
+        let col1_len = col1_len_sq.sqrt();
+        let col2_len = col2_len_sq.sqrt();
+        // Zero matrix: representable as scaling(0,0) with any rotation.
+        let both_zero = col1_len <= tol.absolute && col2_len <= tol.absolute;
+        if !both_zero {
+            // Relative orthogonality: |dot| <= tol.absolute * |col1| * |col2|.
+            // tol.absolute is used as a dimensionless cosine tolerance.
+            let bound = tol.absolute * col1_len * col2_len;
+            if dot.abs() > bound {
+                return Err(GeometryError::Degenerate(
+                    "compose produces non-representable shear (frozen R*diag form)",
+                ));
+            }
+        }
+        // Extract (rotation, scale_x, scale_y) from M's columns.
+        let (new_rotation, new_scale_x, new_scale_y) = if col1_len > tol.absolute {
+            let new_rotation = m10.atan2(m00);
+            let new_scale_x = col1_len;
+            let det = m00 * m11 - m01 * m10;
+            let new_scale_y = det / new_scale_x;
+            (new_rotation, new_scale_x, new_scale_y)
+        } else {
+            // col1 is zero (scale_x = 0): extract from col2.
+            // M = R(phi)*diag(0, sy). col2 = M*e2 = sy*(-sin phi, cos phi).
+            // So sy = |col2| (sign ambiguous when det=0; take positive) and
+            // phi = atan2(-col2.x, col2.y) = atan2(-m01, m11).
+            let new_scale_x = 0.0;
+            let new_scale_y = col2_len;
+            let new_rotation = (-m01).atan2(m11);
+            (new_rotation, new_scale_x, new_scale_y)
+        };
+        Ok(Self {
+            translation: new_translation,
+            rotation_rad: new_rotation,
             scale_x: new_scale_x,
             scale_y: new_scale_y,
-        }
+        })
     }
 
     /// Inverse of `self`, or `None` when the inverse is not representable in
@@ -198,23 +230,24 @@ impl Transform2D {
     ///
     /// - `None` if `scale_x == 0` or `scale_y == 0` (singular);
     /// - `None` if scale is non-uniform (`scale_x != scale_y` within
-    ///   [`Tolerance::DEFAULT`](crate::tolerance::Tolerance::DEFAULT)) AND
-    ///   rotation is non-zero (within the same tolerance), because the inverse
-    ///   linear map `S_inv·R_-rot` has non-orthogonal columns and is not
-    ///   expressible as `R·diag` without changing the frozen contract (which
-    ///   would require an Architecture Change Request);
+    ///   `tol.absolute`) AND rotation is non-zero (within the same
+    ///   tolerance), because the inverse linear map `S_inv·R_-rot` has
+    ///   non-orthogonal columns and is not expressible as `R·diag` without
+    ///   changing the frozen contract (which would require an Architecture
+    ///   Change Request);
     /// - otherwise the exact inverse.
+    ///
+    /// The `tol` policy is explicit per the frozen v1.1 contract.
     ///
     /// Evidence: WO-002-AC03 — singular and non-representable inverses are
     /// explicitly rejected rather than approximated.
     #[must_use]
-    pub fn inverse(&self) -> Option<Self> {
+    pub fn inverse(&self, tol: Tolerance) -> Option<Self> {
         if self.scale_x == 0.0 || self.scale_y == 0.0 {
             return None;
         }
-        let tol = crate::tolerance::Tolerance::DEFAULT.absolute;
-        let uniform_scale = (self.scale_x - self.scale_y).abs() <= tol;
-        let zero_rotation = self.rotation_rad.abs() <= tol;
+        let uniform_scale = (self.scale_x - self.scale_y).abs() <= tol.absolute;
+        let zero_rotation = self.rotation_rad.abs() <= tol.absolute;
         if !uniform_scale && !zero_rotation {
             // The inverse linear map S_inv·R_-rot has non-orthogonal columns
             // and is not expressible as R·diag within the frozen Transform2D
@@ -261,8 +294,10 @@ impl Default for Transform2D {
 impl Transformable2 for Transform2D {
     /// `self.transform(t)` returns `self.compose(t)`: the result applies `t`
     /// first, then `self`. (Composes the right operand as the "inner" map.)
-    fn transform(&self, transform: &Transform2D) -> Self {
-        self.compose(transform)
+    /// Returns `Err` when the composition produces shear unrepresentable
+    /// in the frozen `R·diag` form.
+    fn transform(&self, transform: &Transform2D, tol: Tolerance) -> Result<Self, GeometryError> {
+        self.compose(transform, tol)
     }
 }
 
@@ -332,7 +367,9 @@ mod tests {
         // Uniform scale (1.5, 1.5) + rotation 0.4: the inverse IS representable
         // as a Transform2D (uniform scale commutes with rotation).
         let t = Transform2D::new(Vector2::new(3.0, -2.0).unwrap(), 0.4, 1.5, 1.5).unwrap();
-        let inv = t.inverse().expect("representable inverse");
+        let inv = t
+            .inverse(Tolerance::DEFAULT)
+            .expect("representable inverse");
         let p = Point2::new(1.7, 0.3).unwrap();
         let q = t.apply_point(&p);
         let r = inv.apply_point(&q);
@@ -346,29 +383,86 @@ mod tests {
         // representable as Transform2D (R·diag); the inverse is explicitly
         // rejected rather than approximated (frozen-contract preserving).
         let t = Transform2D::new(Vector2::ZERO, 0.4, 1.5, 2.0).unwrap();
-        assert!(t.inverse().is_none());
+        assert!(t.inverse(Tolerance::DEFAULT).is_none());
     }
 
     #[test]
     fn inverse_of_singular_is_none() {
         // Evidence: WO-002-AC03 — singular (zero-scale) transform inversion rejected.
         let t = Transform2D::scaling(0.0, 1.0);
-        assert!(t.inverse().is_none());
+        assert!(t.inverse(Tolerance::DEFAULT).is_none());
         let t = Transform2D::scaling(1.0, 0.0);
-        assert!(t.inverse().is_none());
+        assert!(t.inverse(Tolerance::DEFAULT).is_none());
     }
 
     #[test]
-    fn compose_with_identity() {
+    fn compose_identity_preserves() {
+        // Evidence: WO-002-AC04 — composing with identity is exact (up to
+        // floating-point extraction error).
         let t = Transform2D::new(Vector2::new(1.0, 2.0).unwrap(), 0.5, 2.0, 3.0).unwrap();
         let id = Transform2D::identity();
-        let c1 = t.compose(&id);
-        let c2 = id.compose(&t);
-        let p = Point2::new(0.7, -1.2).unwrap();
-        let p1 = c1.apply_point(&p);
-        let p2 = c2.apply_point(&p);
-        assert!(approx(p1.x, p2.x));
-        assert!(approx(p1.y, p2.y));
+        let c1 = t.compose(&id, Tolerance::DEFAULT).unwrap();
+        let c2 = id.compose(&t, Tolerance::DEFAULT).unwrap();
+        assert!(approx(c1.translation.x, t.translation.x));
+        assert!(approx(c1.translation.y, t.translation.y));
+        assert!(approx(c1.rotation_rad, t.rotation_rad));
+        assert!(approx(c1.scale_x, t.scale_x));
+        assert!(approx(c1.scale_y, t.scale_y));
+        assert!(approx(c2.translation.x, t.translation.x));
+        assert!(approx(c2.translation.y, t.translation.y));
+        assert!(approx(c2.rotation_rad, t.rotation_rad));
+        assert!(approx(c2.scale_x, t.scale_x));
+        assert!(approx(c2.scale_y, t.scale_y));
+    }
+
+    #[test]
+    fn compose_exact_for_uniform_scale_and_rotation() {
+        // Evidence: WO-002-AC02 — compose is exact when both factors have
+        // uniform scale (no shear is introduced).
+        let a = Transform2D::new(Vector2::new(1.0, 0.0).unwrap(), 0.5, 2.0, 2.0).unwrap();
+        let b = Transform2D::new(Vector2::new(-1.0, 3.0).unwrap(), 0.4, 1.5, 1.5).unwrap();
+        let c = a
+            .compose(&b, Tolerance::DEFAULT)
+            .expect("representable compose");
+        for (px, py) in [(0.7, -1.2), (3.0, 4.0), (-2.5, 0.1), (10.0, -10.0)] {
+            let p = Point2::new(px, py).unwrap();
+            let direct = a.apply_point(&b.apply_point(&p));
+            let composed = c.apply_point(&p);
+            assert!(approx(direct.x, composed.x), "x mismatch at {px},{py}");
+            assert!(approx(direct.y, composed.y), "y mismatch at {px},{py}");
+        }
+    }
+
+    #[test]
+    fn compose_exact_for_nonuniform_scale_zero_rotation() {
+        // Evidence: WO-002-AC02 — non-uniform scale + zero rotation (self)
+        // composes exactly when the rhs ALSO has zero rotation (so no
+        // shear is introduced: the orthogonality condition
+        // `(sy_a²-sx_a²)·sin(φ_b)·cos(φ_b)==0` holds trivially when
+        // `φ_b==0`).
+        let a = Transform2D::new(Vector2::new(1.0, 0.0).unwrap(), 0.0, 2.0, 3.0).unwrap();
+        let b = Transform2D::new(Vector2::new(-1.0, 3.0).unwrap(), 0.0, 1.5, 1.5).unwrap();
+        let c = a
+            .compose(&b, Tolerance::DEFAULT)
+            .expect("representable compose");
+        for (px, py) in [(0.7, -1.2), (3.0, 4.0), (-2.5, 0.1)] {
+            let p = Point2::new(px, py).unwrap();
+            let direct = a.apply_point(&b.apply_point(&p));
+            let composed = c.apply_point(&p);
+            assert!(approx(direct.x, composed.x), "x mismatch at {px},{py}");
+            assert!(approx(direct.y, composed.y), "y mismatch at {px},{py}");
+        }
+    }
+
+    #[test]
+    fn compose_rejects_shear() {
+        // Evidence: WO-002-AC03 — non-uniform scale (self) + non-zero
+        // rotation (rhs) produces shear unrepresentable in the frozen
+        // R·diag form; explicitly rejected rather than approximated.
+        let a = Transform2D::new(Vector2::ZERO, 0.0, 2.0, 3.0).unwrap();
+        let b = Transform2D::new(Vector2::ZERO, 0.4, 1.0, 1.0).unwrap();
+        let err = a.compose(&b, Tolerance::DEFAULT).unwrap_err();
+        assert!(matches!(err, GeometryError::Degenerate(_)));
     }
 
     #[test]
@@ -396,8 +490,8 @@ mod tests {
         // self.transform(t) = self.compose(t).
         let a = Transform2D::new(Vector2::new(1.0, 0.0).unwrap(), 0.1, 1.0, 1.0).unwrap();
         let b = Transform2D::new(Vector2::new(0.0, 2.0).unwrap(), 0.2, 1.5, 1.0).unwrap();
-        let via_trait = a.transform(&b);
-        let via_compose = a.compose(&b);
+        let via_trait = a.transform(&b, Tolerance::DEFAULT).unwrap();
+        let via_compose = a.compose(&b, Tolerance::DEFAULT).unwrap();
         assert_eq!(via_trait, via_compose);
     }
 }

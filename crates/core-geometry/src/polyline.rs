@@ -66,9 +66,10 @@ impl Polyline2 {
     /// Returns the `i`-th segment of the polyline (open: 0..=n-2; closed:
     /// 0..=n-1, where segment n-1 connects the last vertex to the first).
     ///
-    /// Returns `None` if `i` is out of range. The returned segment may be
-    /// degenerate (zero-length) if the underlying vertices are coincident —
-    /// callers requiring non-degenerate segments must check separately.
+    /// Returns `None` if `i` is out of range OR if the segment is
+    /// degenerate (adjacent coincident vertices). The segment is always
+    /// constructed via [`LineSegment2::new`], which rejects zero-length
+    /// segments — `segment()` never bypasses that invariant.
     #[must_use]
     pub fn segment(&self, i: usize) -> Option<LineSegment2> {
         if i >= self.segment_count() {
@@ -81,15 +82,8 @@ impl Polyline2 {
         } else {
             self.vertices[i + 1]
         };
-        // If start==end the polyline has coincident adjacent vertices (not
-        // caught by `new()` — `new` only rejects insufficient vertex counts,
-        // not duplicate-adjacent vertices). Return a degenerate "zero
-        // segment" by constructing via the unchecked path.
-        if start.x == end.x && start.y == end.y {
-            return Some(LineSegment2 { start, end });
-        }
-        // `LineSegment2::new` is infallible for distinct finite points; use
-        // it to keep the path canonical.
+        // Route through `LineSegment2::new` to preserve the type invariant;
+        // returns None for zero-length (adjacent coincident vertices).
         LineSegment2::new(start, end).ok()
     }
 
@@ -170,16 +164,19 @@ impl Bounded2 for Polyline2 {
 }
 
 impl Transformable2 for Polyline2 {
-    fn transform(&self, transform: &Transform2D) -> Self {
+    fn transform(&self, transform: &Transform2D, _tol: Tolerance) -> Result<Self, GeometryError> {
         let vertices = self
             .vertices
             .iter()
             .map(|p| transform.apply_point(p))
             .collect();
-        Self {
+        // A polyline's image is always representable (no shape constraint);
+        // adjacent vertices that collapse to coincident under a singular
+        // transform produce `None` segments via `segment()`, which is fine.
+        Ok(Self {
             vertices,
             closed: self.closed,
-        }
+        })
     }
 }
 
@@ -190,14 +187,14 @@ impl DistanceTo2<Point2> for Polyline2 {
 }
 
 impl Project2 for Polyline2 {
-    fn project_point(&self, point: &Point2) -> Point2 {
+    fn project_point(&self, point: &Point2, _tol: Tolerance) -> Point2 {
         self.project_point(point)
     }
 }
 
 impl Contains2<Point2> for Polyline2 {
-    fn contains(&self, rhs: &Point2) -> bool {
-        self.contains_point(rhs, Tolerance::DEFAULT)
+    fn contains(&self, rhs: &Point2, tol: Tolerance) -> bool {
+        self.contains_point(rhs, tol)
     }
 }
 
@@ -357,7 +354,7 @@ mod tests {
         let q = p.project_point(&Point2::new(1.0, 0.5).unwrap());
         assert!(approx(q.x, 1.0));
         assert!(approx(q.y, 0.0));
-        assert!(p.contains(&q));
+        assert!(p.contains(&q, Tolerance::DEFAULT));
     }
 
     #[test]
@@ -408,7 +405,9 @@ mod tests {
             Point2::new(3.0, 4.0).unwrap(),
         ];
         let p = Polyline2::new(pts, false).unwrap();
-        let q = p.transform(&Transform2D::identity());
+        let q = p
+            .transform(&Transform2D::identity(), Tolerance::DEFAULT)
+            .unwrap();
         for (a, b) in p.vertices.iter().zip(q.vertices.iter()) {
             assert!(approx(a.x, b.x));
             assert!(approx(a.y, b.y));
@@ -430,6 +429,29 @@ mod tests {
                 assert!(bb.contains(q));
             }
         }
+    }
+
+    #[test]
+    fn polyline_segment_returns_none_for_adjacent_duplicates() {
+        // Evidence: WO-002-AC03 — adjacent coincident vertices produce a
+        // degenerate (zero-length) segment; `segment()` routes through
+        // `LineSegment2::new` (which rejects zero-length) and returns `None`.
+        // The type invariant of `LineSegment2` is never bypassed.
+        let pts = vec![
+            Point2::new(0.0, 0.0).unwrap(),
+            Point2::new(1.0, 1.0).unwrap(),
+            Point2::new(1.0, 1.0).unwrap(), // duplicate of previous
+            Point2::new(2.0, 2.0).unwrap(),
+        ];
+        let p = Polyline2::new(pts, false).unwrap();
+        // segment(0): (0,0) -> (1,1) — valid.
+        assert!(p.segment(0).is_some());
+        // segment(1): (1,1) -> (1,1) — degenerate, returns None.
+        assert!(p.segment(1).is_none());
+        // segment(2): (1,1) -> (2,2) — valid.
+        assert!(p.segment(2).is_some());
+        // segment(3): out of range.
+        assert!(p.segment(3).is_none());
     }
 
     #[test]

@@ -51,15 +51,17 @@ impl Circle2 {
         2.0 * std::f64::consts::PI * self.radius
     }
 
-    /// Closest point on the circle curve to `p`. If `p == center`, returns
-    /// `center + (radius, 0)`.
+    /// Closest point on the circle curve to `p`. If `p == center` (exact
+    /// zero check — no implicit tolerance per the frozen v1.1 contract),
+    /// returns `center + (radius, 0)`.
     #[must_use]
     pub fn project_point(&self, p: &Point2) -> Point2 {
         let v = self.center.vector_to(*p);
-        if v.is_zero(Tolerance::DEFAULT) {
+        if v.length_squared() == 0.0 {
             return Point2::new_unchecked(self.center.x + self.radius, self.center.y);
         }
-        let n = v.normalize_with(Tolerance::DEFAULT).unwrap_or(Vector2::I);
+        let len = v.length();
+        let n = Vector2::new_unchecked(v.x / len, v.y / len);
         Point2::new_unchecked(
             self.center.x + n.x * self.radius,
             self.center.y + n.y * self.radius,
@@ -126,19 +128,27 @@ impl Bounded2 for Circle2 {
 }
 
 impl Transformable2 for Circle2 {
-    /// Transform the circle's center by `transform`, and scale the radius by
-    /// `|scale_x|`. For uniform scaling (`scale_x == scale_y`), this is
-    /// exact. For non-uniform scaling the resulting circle is a *uniform*
-    /// approximation — the exact transformed shape would be an
-    /// [`crate::ellipse::Ellipse2`]; producing ellipses from non-uniform
-    /// circle scaling is the responsibility of [`Ellipse2`], not `Circle2`.
-    fn transform(&self, transform: &Transform2D) -> Self {
-        let new_center = transform.apply_point(&self.center);
-        let s = transform.scale_x.abs();
-        Self {
-            center: new_center,
-            radius: self.radius * s,
+    /// Transform the circle's center by `transform`, and scale the radius
+    /// by `|scale_x|` (== `|scale_y|` for representable cases).
+    ///
+    /// Returns `Err(GeometryError::Degenerate(_))` when `transform` has
+    /// non-uniform scale (`|scale_x| != |scale_y|` within `tol`): the image
+    /// of a circle under non-uniform scaling is an ellipse, which is not
+    /// representable in the frozen `Circle2` form. Also returns `Err` when
+    /// the transform is singular and collapses the circle to a point
+    /// (zero-radius result is rejected by `Circle2::new`).
+    ///
+    /// Evidence: WO-002-AC03 — non-representable images explicitly rejected
+    /// rather than silently approximated.
+    fn transform(&self, transform: &Transform2D, tol: Tolerance) -> Result<Self, GeometryError> {
+        if !tol.eq(transform.scale_x.abs(), transform.scale_y.abs()) {
+            return Err(GeometryError::Degenerate(
+                "non-uniform scale cannot be represented as a circle (frozen Circle2 form)",
+            ));
         }
+        let new_center = transform.apply_point(&self.center);
+        let new_radius = self.radius * transform.scale_x.abs();
+        Circle2::new(new_center, new_radius)
     }
 }
 
@@ -149,14 +159,14 @@ impl DistanceTo2<Point2> for Circle2 {
 }
 
 impl Project2 for Circle2 {
-    fn project_point(&self, point: &Point2) -> Point2 {
+    fn project_point(&self, point: &Point2, _tol: Tolerance) -> Point2 {
         self.project_point(point)
     }
 }
 
 impl Contains2<Point2> for Circle2 {
-    fn contains(&self, rhs: &Point2) -> bool {
-        self.contains_point(rhs, Tolerance::DEFAULT)
+    fn contains(&self, rhs: &Point2, tol: Tolerance) -> bool {
+        self.contains_point(rhs, tol)
     }
 }
 
@@ -179,7 +189,10 @@ impl Intersect2<Circle2> for Circle2 {
         if (d - r_sum).abs() <= tolerance.absolute || (d - r_diff).abs() <= tolerance.absolute {
             // Single tangent point along the line of centers.
             let dir = if d > tolerance.absolute {
-                self.center.vector_to(rhs.center).normalize().unwrap()
+                self.center
+                    .vector_to(rhs.center)
+                    .normalize_with(tolerance)
+                    .unwrap_or(Vector2::I)
             } else {
                 Vector2::I
             };
@@ -205,9 +218,7 @@ impl Intersect2<Circle2> for Circle2 {
             Vector2::I
         };
         let perp = Vector2::new_unchecked(-axis.y, axis.x);
-        let pn = perp
-            .normalize_with(Tolerance::DEFAULT)
-            .unwrap_or(Vector2::J);
+        let pn = perp.normalize_with(tolerance).unwrap_or(Vector2::J);
         let p1 = Point2::new_unchecked(px + pn.x * h, py + pn.y * h);
         let p2 = Point2::new_unchecked(px - pn.x * h, py - pn.y * h);
         if (p1.x - p2.x).abs() <= tolerance.absolute && (p1.y - p2.y).abs() <= tolerance.absolute {
@@ -329,7 +340,7 @@ impl Arc2 {
             return Err(GeometryError::Degenerate("zero or negative radius"));
         }
         let s = Self::normalize_sweep(sweep_angle);
-        if s.abs() <= Tolerance::DEFAULT.absolute {
+        if s == 0.0 {
             return Err(GeometryError::Degenerate("zero-sweep arc"));
         }
         Ok(Self {
@@ -412,11 +423,13 @@ impl Arc2 {
 
     /// Closest point on the arc curve to `p`. Projects to the underlying
     /// circle; if the projected angle is inside the arc range, returns that
-    /// projected point; otherwise returns the nearer endpoint.
+    /// projected point; otherwise returns the nearer endpoint. The
+    /// center-coincidence check is exact-zero (no implicit tolerance per
+    /// the frozen v1.1 contract).
     #[must_use]
     pub fn project_point(&self, p: &Point2) -> Point2 {
         let v = self.center.vector_to(*p);
-        if v.is_zero(Tolerance::DEFAULT) {
+        if v.length_squared() == 0.0 {
             return self.start_point();
         }
         let a = v.y.atan2(v.x);
@@ -458,7 +471,7 @@ impl Validate for Arc2 {
         if self.radius <= 0.0 {
             return Err(GeometryError::Degenerate("zero or negative radius"));
         }
-        if self.sweep_angle.abs() <= Tolerance::DEFAULT.absolute {
+        if self.sweep_angle == 0.0 {
             return Err(GeometryError::Degenerate("zero-sweep arc"));
         }
         Ok(())
@@ -487,19 +500,38 @@ impl Bounded2 for Arc2 {
 }
 
 impl Transformable2 for Arc2 {
-    fn transform(&self, transform: &Transform2D) -> Self {
+    /// Transform the arc's center, radius, and angles by `transform`.
+    ///
+    /// Returns `Err(GeometryError::Degenerate(_))` when `transform` has
+    /// non-uniform scale (`|scale_x| != |scale_y|` within `tol`): the image
+    /// of a circular arc under non-uniform scaling is an elliptic arc, not
+    /// representable in the frozen `Arc2` form. Reflection (sign-flip of
+    /// exactly one scale) is handled correctly (sweep sign flips).
+    ///
+    /// Evidence: WO-002-AC03 — non-representable images explicitly rejected
+    /// rather than silently approximated.
+    fn transform(&self, transform: &Transform2D, tol: Tolerance) -> Result<Self, GeometryError> {
+        if !tol.eq(transform.scale_x.abs(), transform.scale_y.abs()) {
+            return Err(GeometryError::Degenerate(
+                "non-uniform scale cannot be represented as an arc (frozen Arc2 form)",
+            ));
+        }
         let new_center = transform.apply_point(&self.center);
         let s = transform.scale_x.abs();
         let new_radius = self.radius * s;
-        // The arc's angles are unaffected by translation and uniform scale.
-        // Non-uniform scaling of an arc is a non-trivial transformation
-        // (becomes an elliptical arc) which is explicitly out of scope here.
-        Self {
-            center: new_center,
-            radius: new_radius,
-            start_angle: self.start_angle,
-            sweep_angle: self.sweep_angle,
-        }
+        let phi = transform.rotation_rad;
+        let reflection = (transform.scale_x * transform.scale_y) < 0.0;
+        let extra_pi = if transform.scale_x < 0.0 {
+            std::f64::consts::PI
+        } else {
+            0.0
+        };
+        let (new_start, new_sweep) = if reflection {
+            (phi + extra_pi - self.start_angle, -self.sweep_angle)
+        } else {
+            (phi + extra_pi + self.start_angle, self.sweep_angle)
+        };
+        Arc2::new(new_center, new_radius, new_start, new_sweep)
     }
 }
 
@@ -510,14 +542,14 @@ impl DistanceTo2<Point2> for Arc2 {
 }
 
 impl Project2 for Arc2 {
-    fn project_point(&self, point: &Point2) -> Point2 {
+    fn project_point(&self, point: &Point2, _tol: Tolerance) -> Point2 {
         self.project_point(point)
     }
 }
 
 impl Contains2<Point2> for Arc2 {
-    fn contains(&self, rhs: &Point2) -> bool {
-        self.contains_point(rhs, Tolerance::DEFAULT)
+    fn contains(&self, rhs: &Point2, tol: Tolerance) -> bool {
+        self.contains_point(rhs, tol)
     }
 }
 
@@ -656,7 +688,7 @@ mod tests {
     #[test]
     fn circle_contains_curve_excludes_center() {
         let c = Circle2::new(Point2::new(1.0, 2.0).unwrap(), 3.0).unwrap();
-        assert!(!c.contains(&c.center));
+        assert!(!c.contains(&c.center, Tolerance::DEFAULT));
     }
 
     #[test]
@@ -768,10 +800,71 @@ mod tests {
     fn transform_identity_preserves_circle() {
         // Evidence: WO-002-AC04 — identity transform invariance.
         let c = Circle2::new(Point2::new(1.0, 2.0).unwrap(), 3.0).unwrap();
-        let t = c.transform(&Transform2D::identity());
+        let t = c
+            .transform(&Transform2D::identity(), Tolerance::DEFAULT)
+            .unwrap();
         assert!(approx(t.center.x, 1.0));
         assert!(approx(t.center.y, 2.0));
         assert!(approx(t.radius, 3.0));
+    }
+
+    #[test]
+    fn circle_transform_uniform_scale_and_rotation_ok() {
+        // Evidence: WO-002-AC02 — uniform scale + rotation is representable;
+        // the image circle has the transformed center and radius * |scale|.
+        let c = Circle2::new(Point2::new(1.0, 1.0).unwrap(), 2.0).unwrap();
+        let t = Transform2D::new(Vector2::new(1.0, 0.0).unwrap(), 0.5, 3.0, 3.0).unwrap();
+        let img = c.transform(&t, Tolerance::DEFAULT).unwrap();
+        assert!(approx(img.center.x, t.apply_point(&c.center).x));
+        assert!(approx(img.center.y, t.apply_point(&c.center).y));
+        assert!(approx(img.radius, 6.0));
+    }
+
+    #[test]
+    fn circle_transform_non_uniform_rejected() {
+        // Evidence: WO-002-AC03 — non-uniform scale produces an ellipse,
+        // not representable as Circle2; explicitly rejected.
+        let c = Circle2::new(Point2::ORIGIN, 2.0).unwrap();
+        let t = Transform2D::scaling(2.0, 3.0);
+        let err = c.transform(&t, Tolerance::DEFAULT).unwrap_err();
+        assert!(matches!(err, GeometryError::Degenerate(_)));
+    }
+
+    #[test]
+    fn arc_transform_uniform_preserves_endpoints() {
+        // Evidence: WO-002-AC04 — arc transform maps endpoints to the
+        // transformed endpoint positions (uniform scale + rotation case).
+        let a = Arc2::new(Point2::ORIGIN, 1.0, 0.0, std::f64::consts::FRAC_PI_2).unwrap();
+        let t = Transform2D::new(Vector2::ZERO, std::f64::consts::FRAC_PI_4, 2.0, 2.0).unwrap();
+        let img = a.transform(&t, Tolerance::DEFAULT).unwrap();
+        let new_start = img.start_point();
+        let new_end = img.end_point();
+        let exp_start = t.apply_point(&a.start_point());
+        let exp_end = t.apply_point(&a.end_point());
+        assert!(approx(new_start.x, exp_start.x));
+        assert!(approx(new_start.y, exp_start.y));
+        assert!(approx(new_end.x, exp_end.x));
+        assert!(approx(new_end.y, exp_end.y));
+    }
+
+    #[test]
+    fn arc_transform_reflection_flips_sweep() {
+        // Evidence: WO-002-AC02 — reflection (sign-flip of exactly one
+        // scale) flips the sweep direction.
+        let a = Arc2::new(Point2::ORIGIN, 1.0, 0.0, std::f64::consts::FRAC_PI_2).unwrap();
+        let t = Transform2D::scaling(1.0, -1.0); // reflection across x-axis
+        let img = a.transform(&t, Tolerance::DEFAULT).unwrap();
+        assert!(approx(img.sweep_angle, -a.sweep_angle));
+    }
+
+    #[test]
+    fn arc_transform_non_uniform_rejected() {
+        // Evidence: WO-002-AC03 — non-uniform scale produces an elliptic
+        // arc, not representable as Arc2.
+        let a = Arc2::new(Point2::ORIGIN, 1.0, 0.0, std::f64::consts::FRAC_PI_2).unwrap();
+        let t = Transform2D::scaling(2.0, 3.0);
+        let err = a.transform(&t, Tolerance::DEFAULT).unwrap_err();
+        assert!(matches!(err, GeometryError::Degenerate(_)));
     }
 
     #[test]

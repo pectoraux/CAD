@@ -46,10 +46,22 @@ pub trait Bounded2 {
 }
 
 /// Located-primitive affine transformation under a [`Transform2D`].
+///
+/// Returns `Err(GeometryError::Degenerate(_))` when the image of `self` under
+/// `transform` cannot be represented in `self`'s frozen primitive form within
+/// the supplied `tol` policy. For example, a [`crate::circle::Circle2`] under
+/// non-uniform scaling becomes an ellipse and is not representable as a
+/// `Circle2`; a [`crate::transform::Transform2D`] composed with another may
+/// produce shear unrepresentable in the frozen `R·diag` form. The tolerance is
+/// explicit per the frozen v1.1 contract: "tolerance is never implicit or
+/// caller-chosen on a per-operation basis."
 pub trait Transformable2 {
-    /// Returns a copy of `self` with `transform` applied.
+    /// Returns a copy of `self` with `transform` applied, or an error when the
+    /// image is not representable in `self`'s frozen primitive form.
     #[must_use]
-    fn transform(&self, transform: &Transform2D) -> Self;
+    fn transform(&self, transform: &Transform2D, tol: Tolerance) -> Result<Self, GeometryError>
+    where
+        Self: Sized;
 }
 
 /// Distance from `self` to a `Rhs` located primitive.
@@ -62,19 +74,27 @@ pub trait DistanceTo2<Rhs = Point2> {
 
 /// Closest point of `self` to `point` (orthogonal projection, clamped to the
 /// primitive where applicable).
+///
+/// The `tol` policy is used by impls that internally normalize directions or
+/// detect degeneracy (e.g. projecting onto a [`crate::circle::Circle2`] from
+/// its center). It is explicit per the frozen v1.1 contract.
 pub trait Project2 {
     /// Returns the point of `self` nearest to `point`.
     #[must_use]
-    fn project_point(&self, point: &Point2) -> Point2;
+    fn project_point(&self, point: &Point2, tol: Tolerance) -> Point2;
 }
 
 /// Set-membership containment test for a `Rhs` located primitive inside
 /// `self`. For curve primitives this tests *on-curve* membership; for area
 /// primitives it tests inside-the-region. See impl docs.
+///
+/// The `tol` policy is explicit per the frozen v1.1 contract: "tolerance is
+/// never implicit or caller-chosen on a per-operation basis."
 pub trait Contains2<Rhs = Point2> {
-    /// Returns `true` if `rhs` lies on/inside `self` per the impl's semantics.
+    /// Returns `true` if `rhs` lies on/inside `self` per the impl's semantics,
+    /// within the supplied `tol`.
     #[must_use]
-    fn contains(&self, rhs: &Rhs) -> bool;
+    fn contains(&self, rhs: &Rhs, tol: Tolerance) -> bool;
 }
 
 /// Intersection between two located primitives. The predicate is robust and

@@ -99,14 +99,10 @@ impl Vector2 {
     }
 
     /// Returns the unit vector in the direction of `self`, or `None` if
-    /// `self` is near-zero length (uses [`Tolerance::DEFAULT`]).
-    #[must_use]
-    pub fn normalize(self) -> Option<Self> {
-        self.normalize_with(Tolerance::DEFAULT)
-    }
-
-    /// Returns the unit vector using the supplied tolerance for the
-    /// near-zero check, or `None` if the vector is degenerate.
+    /// `self` is near-zero length within the supplied `tolerance` policy.
+    ///
+    /// Per the frozen v1.1 contract, tolerance is never implicit; callers
+    /// must supply the policy appropriate to their scope.
     #[must_use]
     pub fn normalize_with(self, tolerance: Tolerance) -> Option<Self> {
         if self.is_zero(tolerance) {
@@ -228,8 +224,11 @@ mod tests {
 
     #[test]
     fn normalize_zero_handling() {
-        assert!(Vector2::ZERO.normalize().is_none());
-        let n = Vector2::new(3.0, 4.0).unwrap().normalize().unwrap();
+        assert!(Vector2::ZERO.normalize_with(Tolerance::DEFAULT).is_none());
+        let n = Vector2::new(3.0, 4.0)
+            .unwrap()
+            .normalize_with(Tolerance::DEFAULT)
+            .unwrap();
         assert!(approx(n.length(), 1.0));
     }
 

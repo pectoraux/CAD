@@ -180,8 +180,9 @@ impl Bounded2 for BoundingBox2 {
 impl Transformable2 for BoundingBox2 {
     /// Transform a bounding box: rotate/scale/translate all four corners and
     /// then re-fit an axis-aligned box. The resulting AABB is conservative
-    /// (it may be larger than the rotated box; never smaller).
-    fn transform(&self, transform: &Transform2D) -> Self {
+    /// (it may be larger than the rotated box; never smaller). Always
+    /// representable — returns `Ok`.
+    fn transform(&self, transform: &Transform2D, _tol: Tolerance) -> Result<Self, GeometryError> {
         let mut min_x = f64::INFINITY;
         let mut min_y = f64::INFINITY;
         let mut max_x = f64::NEG_INFINITY;
@@ -201,21 +202,24 @@ impl Transformable2 for BoundingBox2 {
                 max_y = p.y;
             }
         }
-        Self {
+        Ok(Self {
             min: Point2::new_unchecked(min_x, min_y),
             max: Point2::new_unchecked(max_x, max_y),
-        }
+        })
     }
 }
 
 impl Contains2<Point2> for BoundingBox2 {
-    fn contains(&self, rhs: &Point2) -> bool {
+    /// Containment is exact (no tolerance needed for an AABB point-in-box
+    /// test); the `tol` parameter is accepted for trait-signature
+    /// consistency and ignored.
+    fn contains(&self, rhs: &Point2, _tol: Tolerance) -> bool {
         BoundingBox2::contains(self, rhs)
     }
 }
 
 impl Contains2<BoundingBox2> for BoundingBox2 {
-    fn contains(&self, rhs: &BoundingBox2) -> bool {
+    fn contains(&self, rhs: &BoundingBox2, _tol: Tolerance) -> bool {
         BoundingBox2::contains_box(self, rhs)
     }
 }
@@ -332,9 +336,9 @@ mod tests {
         ];
         let b1 = BoundingBox2::from_points(&pts).unwrap();
         let t = Transform2D::translation(7.0, -4.0);
-        let transformed_pts = pts.map(|p| p.transform(&t));
+        let transformed_pts = pts.map(|p| p.transform(&t, Tolerance::DEFAULT).unwrap());
         let b2 = BoundingBox2::from_points(&transformed_pts).unwrap();
-        let b3 = b1.transform(&t);
+        let b3 = b1.transform(&t, Tolerance::DEFAULT).unwrap();
         assert!(approx(b2.min.x, b3.min.x));
         assert!(approx(b2.min.y, b3.min.y));
         assert!(approx(b2.max.x, b3.max.x));

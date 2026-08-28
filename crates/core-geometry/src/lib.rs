@@ -237,7 +237,9 @@ mod tests {
         let mut prng = Prng::new();
         for _ in 0..256 {
             let p = Point2::new(prng.signed_f64(1000.0), prng.signed_f64(1000.0)).unwrap();
-            let q = p.transform(&id);
+            let q = p
+                .transform(&id, crate::tolerance::Tolerance::DEFAULT)
+                .unwrap();
             assert!((q.x - p.x).abs() < 1e-9);
             assert!((q.y - p.y).abs() < 1e-9);
         }

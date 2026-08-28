@@ -12,6 +12,7 @@ use crate::bbox::BoundingBox2;
 use crate::error::GeometryError;
 use crate::ops::{Bounded2, DistanceTo2, Project2, Transformable2, Validate};
 use crate::point::Point2;
+use crate::tolerance::Tolerance;
 use crate::transform::Transform2D;
 use serde::{Deserialize, Serialize};
 
@@ -388,18 +389,19 @@ impl Bounded2 for Spline2 {
 impl Transformable2 for Spline2 {
     /// Affine-transform the control points; weights are unchanged (rational
     /// NURBS is affinely invariant under transformation of control points).
-    fn transform(&self, transform: &Transform2D) -> Self {
+    /// Always representable — returns `Ok`.
+    fn transform(&self, transform: &Transform2D, _tol: Tolerance) -> Result<Self, GeometryError> {
         let control_points = self
             .control_points
             .iter()
             .map(|p| transform.apply_point(p))
             .collect();
-        Self {
+        Ok(Self {
             degree: self.degree,
             control_points,
             knots: self.knots.clone(),
             weights: self.weights.clone(),
-        }
+        })
     }
 }
 
@@ -410,7 +412,10 @@ impl DistanceTo2<Point2> for Spline2 {
 }
 
 impl Project2 for Spline2 {
-    fn project_point(&self, point: &Point2) -> Point2 {
+    fn project_point(&self, point: &Point2, _tol: Tolerance) -> Point2 {
+        // Spline closest-point uses deterministic fixed-count sampling
+        // (no tolerance-gated classification); the `tol` parameter is
+        // accepted for trait-signature consistency and ignored.
         self.project_point(point)
     }
 }
@@ -429,6 +434,7 @@ mod tests {
     use crate::ops::{Bounded2, Transformable2, Validate};
     use crate::point::Point2;
     use crate::testutil::roundtrip;
+    use crate::tolerance::Tolerance;
     use crate::transform::Transform2D;
 
     fn approx(a: f64, b: f64) -> bool {
@@ -574,7 +580,9 @@ mod tests {
             Point2::new(3.0, 0.0).unwrap(),
         ];
         let s = cubic_bezier(pts);
-        let st = s.transform(&Transform2D::identity());
+        let st = s
+            .transform(&Transform2D::identity(), Tolerance::DEFAULT)
+            .unwrap();
         let p = s.evaluate(0.5);
         let q = st.evaluate(0.5);
         assert!(approx(p.x, q.x));

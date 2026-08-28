@@ -118,8 +118,9 @@ impl Bounded2 for Point2 {
 }
 
 impl Transformable2 for Point2 {
-    fn transform(&self, transform: &Transform2D) -> Self {
-        transform.apply_point(self)
+    fn transform(&self, transform: &Transform2D, _tol: Tolerance) -> Result<Self, GeometryError> {
+        // The image of a point under an affine transform is always a point.
+        Ok(transform.apply_point(self))
     }
 }
 
@@ -131,16 +132,15 @@ impl DistanceTo2<Point2> for Point2 {
 
 impl Project2 for Point2 {
     /// Projecting a point onto a point returns the point itself.
-    fn project_point(&self, _point: &Point2) -> Point2 {
+    fn project_point(&self, _point: &Point2, _tol: Tolerance) -> Point2 {
         *self
     }
 }
 
 impl Contains2<Point2> for Point2 {
-    /// A point "contains" another point iff they are coincident within the
-    /// canonical default tolerance.
-    fn contains(&self, rhs: &Point2) -> bool {
-        self.distance_squared_to(*rhs) <= Tolerance::DEFAULT.coincident_squared()
+    /// A point "contains" another point iff they are coincident within `tol`.
+    fn contains(&self, rhs: &Point2, tol: Tolerance) -> bool {
+        self.distance_squared_to(*rhs) <= tol.coincident_squared()
     }
 }
 
@@ -197,7 +197,7 @@ mod tests {
         // Evidence: WO-002-AC04 — transform identity invariance.
         let p = Point2::new(1.5, -2.5).unwrap();
         let id = Transform2D::identity();
-        let q = p.transform(&id);
+        let q = p.transform(&id, Tolerance::DEFAULT).unwrap();
         assert!(approx(q.x, p.x));
         assert!(approx(q.y, p.y));
     }
@@ -206,16 +206,16 @@ mod tests {
     fn project_onto_self_returns_self() {
         let p = Point2::new(1.0, 1.0).unwrap();
         let q = Point2::new(2.0, 5.0).unwrap();
-        assert_eq!(p.project_point(&q), p);
+        assert_eq!(p.project_point(&q, Tolerance::DEFAULT), p);
     }
 
     #[test]
     fn contains_coincident_point() {
         let p = Point2::new(1.0, 2.0).unwrap();
         let q = Point2::new(1.0 + 1e-12, 2.0 - 1e-12).unwrap();
-        assert!(p.contains(&q));
+        assert!(p.contains(&q, Tolerance::DEFAULT));
         let r = Point2::new(1.0 + 1e-3, 2.0).unwrap();
-        assert!(!p.contains(&r));
+        assert!(!p.contains(&r, Tolerance::DEFAULT));
     }
 
     #[test]

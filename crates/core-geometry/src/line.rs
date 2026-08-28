@@ -31,15 +31,18 @@ pub struct Line2 {
 
 impl Line2 {
     /// Construct a line from a point and a non-zero direction. The direction
-    /// is normalized; if it is a zero vector, [`GeometryError::Degenerate`]
-    /// is returned.
+    /// is normalized; if it is a zero vector (exact-zero check — no implicit
+    /// tolerance per the frozen v1.1 contract),
+    /// [`GeometryError::Degenerate`] is returned.
     #[must_use]
     pub fn new(point: Point2, direction: Vector2) -> Result<Self, GeometryError> {
         point.validate()?;
         direction.validate()?;
-        let dir = direction
-            .normalize_with(Tolerance::DEFAULT)
-            .ok_or(GeometryError::Degenerate("line direction is zero"))?;
+        if direction.length_squared() == 0.0 {
+            return Err(GeometryError::Degenerate("line direction is zero"));
+        }
+        let len = direction.length();
+        let dir = Vector2::new_unchecked(direction.x / len, direction.y / len);
         Ok(Self {
             point,
             direction: dir,
@@ -47,13 +50,14 @@ impl Line2 {
     }
 
     /// Construct a line through two distinct points. The direction is
-    /// `(p2 - p1)` normalized. Returns `Degenerate` if `p1 == p2`.
+    /// `(p2 - p1)` normalized. Returns `Degenerate` if `p1 == p2` (exact
+    /// comparison — no implicit tolerance).
     #[must_use]
     pub fn from_two_points(p1: Point2, p2: Point2) -> Result<Self, GeometryError> {
         p1.validate()?;
         p2.validate()?;
         let d = p1.vector_to(p2);
-        if d.is_zero(Tolerance::DEFAULT) {
+        if d.length_squared() == 0.0 {
             return Err(GeometryError::Degenerate(
                 "line from_two_points: coincident points",
             ));
@@ -95,15 +99,23 @@ impl Line2 {
 }
 
 impl Transformable2 for Line2 {
-    fn transform(&self, transform: &Transform2D) -> Self {
+    fn transform(&self, transform: &Transform2D, _tol: Tolerance) -> Result<Self, GeometryError> {
         let p = transform.apply_point(&self.point);
         let d = transform.apply_vector(&self.direction);
-        // direction may no longer be unit after non-uniform scale; re-normalize.
-        let dn = d.normalize_with(Tolerance::DEFAULT).unwrap_or(Vector2::I);
-        Self {
+        // The transformed direction may be zero if the transform is singular
+        // (collapses the line). Reject via exact-zero check (no implicit
+        // tolerance per the frozen v1.1 contract).
+        if d.length_squared() == 0.0 {
+            return Err(GeometryError::Degenerate(
+                "transform collapses line direction to zero",
+            ));
+        }
+        let len = d.length();
+        let dn = Vector2::new_unchecked(d.x / len, d.y / len);
+        Ok(Self {
             point: p,
             direction: dn,
-        }
+        })
     }
 }
 
@@ -114,14 +126,14 @@ impl DistanceTo2<Point2> for Line2 {
 }
 
 impl Project2 for Line2 {
-    fn project_point(&self, point: &Point2) -> Point2 {
+    fn project_point(&self, point: &Point2, _tol: Tolerance) -> Point2 {
         self.project_point(point)
     }
 }
 
 impl Contains2<Point2> for Line2 {
-    fn contains(&self, rhs: &Point2) -> bool {
-        self.contains_point(rhs, Tolerance::DEFAULT)
+    fn contains(&self, rhs: &Point2, tol: Tolerance) -> bool {
+        self.contains_point(rhs, tol)
     }
 }
 
@@ -217,15 +229,14 @@ impl LineSegment2 {
     }
 
     /// Unit direction `end - start` normalized. Since `new()` rejected
-    /// zero-length segments, this is well-defined for any valid segment
-    /// (after `new()`); for safety, returns [`Vector2::ZERO`] if normalization
-    /// fails.
+    /// zero-length segments, the length is always strictly positive;
+    /// normalization is exact (no implicit tolerance per the frozen v1.1
+    /// contract).
     #[must_use]
     pub fn direction(&self) -> Vector2 {
-        self.start
-            .vector_to(self.end)
-            .normalize_with(Tolerance::DEFAULT)
-            .unwrap_or(Vector2::ZERO)
+        let d = self.start.vector_to(self.end);
+        let len = d.length();
+        Vector2::new_unchecked(d.x / len, d.y / len)
     }
 
     /// Midpoint of the segment.
@@ -294,11 +305,13 @@ impl Bounded2 for LineSegment2 {
 }
 
 impl Transformable2 for LineSegment2 {
-    fn transform(&self, transform: &Transform2D) -> Self {
-        Self {
-            start: transform.apply_point(&self.start),
-            end: transform.apply_point(&self.end),
-        }
+    fn transform(&self, transform: &Transform2D, _tol: Tolerance) -> Result<Self, GeometryError> {
+        let new_start = transform.apply_point(&self.start);
+        let new_end = transform.apply_point(&self.end);
+        // Route through `new` so a singular transform that collapses the
+        // segment to zero length is rejected (preserves the LineSegment2
+        // type invariant; never bypasses `new`).
+        LineSegment2::new(new_start, new_end)
     }
 }
 
@@ -310,12 +323,22 @@ impl DistanceTo2<Point2> for LineSegment2 {
 
 impl DistanceTo2<LineSegment2> for LineSegment2 {
     fn distance_to(&self, rhs: &LineSegment2) -> f64 {
-        // Segment-segment distance. If they intersect, distance is 0.
-        if !matches!(
-            self.intersect(rhs, Tolerance::DEFAULT),
-            Intersection2::Empty
-        ) {
-            return 0.0;
+        // Segment-segment distance via exact-arithmetic strict-crossing test
+        // (no implicit tolerance per the frozen v1.1 contract). If the
+        // segments strictly cross, distance is 0; otherwise the minimum of
+        // the four point-to-segment distances (which also catches the
+        // collinear-overlap case because one endpoint projects inside the
+        // other segment with distance 0).
+        let d1 = self.start.vector_to(self.end);
+        let d2 = rhs.start.vector_to(rhs.end);
+        let r = self.start.vector_to(rhs.start);
+        let denom = d1.cross(d2);
+        if denom != 0.0 {
+            let t1 = r.cross(d2) / denom;
+            let t2 = r.cross(d1) / denom;
+            if (0.0..=1.0).contains(&t1) && (0.0..=1.0).contains(&t2) {
+                return 0.0;
+            }
         }
         // Otherwise the minimum of the four point-to-segment distances.
         let candidates = [
@@ -329,14 +352,14 @@ impl DistanceTo2<LineSegment2> for LineSegment2 {
 }
 
 impl Project2 for LineSegment2 {
-    fn project_point(&self, point: &Point2) -> Point2 {
+    fn project_point(&self, point: &Point2, _tol: Tolerance) -> Point2 {
         self.project_point(point)
     }
 }
 
 impl Contains2<Point2> for LineSegment2 {
-    fn contains(&self, rhs: &Point2) -> bool {
-        self.contains_point(rhs, Tolerance::DEFAULT)
+    fn contains(&self, rhs: &Point2, tol: Tolerance) -> bool {
+        self.contains_point(rhs, tol)
     }
 }
 
@@ -415,18 +438,15 @@ impl Intersect2<LineSegment2> for LineSegment2 {
         if lo_s <= tolerance.absolute && hi_s >= 1.0 - tolerance.absolute {
             return Intersection2::Coincident;
         }
-        // Partial overlap → Segment.
+        // Partial overlap → Segment. Route through `new` to preserve the
+        // LineSegment2 type invariant (never bypass `new`).
         let p_lo = Point2::new_unchecked(self.start.x + d1.x * lo_s, self.start.y + d1.y * lo_s);
         let p_hi = Point2::new_unchecked(self.start.x + d1.x * hi_s, self.start.y + d1.y * hi_s);
-        // Validate the segment is non-degenerate (should always be true here
-        // due to the length check above, but defensive).
-        if p_lo == p_hi {
-            Intersection2::Point(p_lo)
-        } else {
-            Intersection2::Segment(LineSegment2 {
-                start: p_lo,
-                end: p_hi,
-            })
+        match LineSegment2::new(p_lo, p_hi) {
+            Ok(seg) => Intersection2::Segment(seg),
+            // The overlap degenerated to a point despite the length check
+            // above (numerical edge case); report as Point.
+            Err(_) => Intersection2::Point(p_lo),
         }
     }
 }
@@ -522,7 +542,7 @@ mod tests {
         let p = s.project_point(&Point2::new(5.0, 5.0).unwrap());
         assert!(approx(p.x, 5.0));
         // Evidence: WO-002-AC04 — projection lies on primitive.
-        assert!(s.contains(&p));
+        assert!(s.contains(&p, Tolerance::DEFAULT));
     }
 
     #[test]
@@ -723,7 +743,7 @@ mod tests {
         )
         .unwrap();
         let id = Transform2D::identity();
-        let t = s.transform(&id);
+        let t = s.transform(&id, Tolerance::DEFAULT).unwrap();
         assert!(approx(t.start.x, s.start.x));
         assert!(approx(t.start.y, s.start.y));
         assert!(approx(t.end.x, s.end.x));

@@ -83,7 +83,9 @@ impl Ellipse2 {
     /// scan if iteration fails to converge. Documented as approximate; exact
     /// closest-point on a rotated ellipse is quartic and is deferred to a
     /// later refinement per W002 scope ("a foundation; sampling-based with
-    /// deterministic sample count is acceptable").
+    /// deterministic sample count is acceptable"). The center-coincidence
+    /// check in `initial_guess_angle` is exact-zero (no implicit tolerance
+    /// per the frozen v1.1 contract).
     #[must_use]
     pub fn project_point(&self, p: &Point2) -> Point2 {
         let local = self.to_local(p);
@@ -128,7 +130,7 @@ impl Ellipse2 {
     }
 
     fn initial_guess_angle(local: &Vector2) -> f64 {
-        if local.is_zero(Tolerance::DEFAULT) {
+        if local.length_squared() == 0.0 {
             return 0.0;
         }
         local.y.atan2(local.x)
@@ -203,58 +205,113 @@ impl Validate for Ellipse2 {
 }
 
 impl Bounded2 for Ellipse2 {
+    /// Exact axis-aligned bounding box of the ellipse.
+    ///
+    /// For an ellipse with center `c`, semi-axes `(rx, ry)`, and rotation
+    /// `θ`, the world-X half-width is `sqrt((rx·cos θ)² + (ry·sin θ)²)` and
+    /// the world-Y half-width is `sqrt((rx·sin θ)² + (ry·cos θ)²)`. These
+    /// are the exact extrema (the cardinal angles 0, π/2, π, 3π/2 in the
+    /// LOCAL frame are NOT generally the world-space extrema once the
+    /// ellipse is rotated).
     fn bounding_box(&self) -> BoundingBox2 {
-        // AABB extrema occur when dP/dt = 0 in local frame, i.e. at angles
-        // 0, π/2, π, 3π/2 in the LOCAL frame, then rotated to world.
-        let corners = [
-            self.point_at_angle(0.0),
-            self.point_at_angle(std::f64::consts::FRAC_PI_2),
-            self.point_at_angle(std::f64::consts::PI),
-            self.point_at_angle(-std::f64::consts::FRAC_PI_2),
-        ];
-        let mut min_x = corners[0].x;
-        let mut max_x = corners[0].x;
-        let mut min_y = corners[0].y;
-        let mut max_y = corners[0].y;
-        for p in &corners[1..] {
-            if p.x < min_x {
-                min_x = p.x;
-            }
-            if p.x > max_x {
-                max_x = p.x;
-            }
-            if p.y < min_y {
-                min_y = p.y;
-            }
-            if p.y > max_y {
-                max_y = p.y;
-            }
-        }
+        let cos = self.rotation_rad.cos();
+        let sin = self.rotation_rad.sin();
+        let rx = self.radii.x;
+        let ry = self.radii.y;
+        let half_w = ((rx * cos).powi(2) + (ry * sin).powi(2)).sqrt();
+        let half_h = ((rx * sin).powi(2) + (ry * cos).powi(2)).sqrt();
         BoundingBox2::new_unchecked(
-            Point2::new_unchecked(min_x, min_y),
-            Point2::new_unchecked(max_x, max_y),
+            Point2::new_unchecked(self.center.x - half_w, self.center.y - half_h),
+            Point2::new_unchecked(self.center.x + half_w, self.center.y + half_h),
         )
     }
 }
 
 impl Transformable2 for Ellipse2 {
-    fn transform(&self, transform: &Transform2D) -> Self {
-        // Transform center; compose rotation; scale radii by the relevant
-        // axis scale (uniform scale → both axes; non-uniform is conservative
-        // since it would change eccentricity).
-        let new_center = transform.apply_point(&self.center);
-        let new_rotation = self.rotation_rad + transform.rotation_rad;
-        // For uniform scale, radii scale by |scale_x|. For non-uniform scale
-        // the exact transformation changes eccentricity; we conservatively
-        // apply the X scale to both (this is a documented approximation — the
-        // exact non-uniform ellipse-to-ellipse transformation is out of
-        // scope per W002).
-        let s = transform.scale_x.abs();
-        Self {
-            center: new_center,
-            radii: Vector2::new_unchecked(self.radii.x * s, self.radii.y * s),
-            rotation_rad: new_rotation,
+    /// Exact affine image of the ellipse.
+    ///
+    /// The image of an ellipse under any affine transform is an ellipse
+    /// (representable), EXCEPT when the transform is singular (collapses to
+    /// a line/point). The exact image ellipse is computed via the
+    /// eigendecomposition of `M·Mᵀ` where `M` is the combined linear map
+    /// from the unit circle: `M = R(φ)·diag(sx, sy)·R(θ)·diag(a, b)`.
+    ///
+    /// Returns `Err(GeometryError::Degenerate(_))` when the transform
+    /// collapses the ellipse to a point or line (singular).
+    ///
+    /// Evidence: WO-002-AC02 — exact image, no silent approximation.
+    /// Evidence: WO-002-AC03 — singular collapse explicitly rejected.
+    fn transform(&self, transform: &Transform2D, tol: Tolerance) -> Result<Self, GeometryError> {
+        let phi = transform.rotation_rad;
+        let sx = transform.scale_x;
+        let sy = transform.scale_y;
+        let theta = self.rotation_rad;
+        let a = self.radii.x;
+        let b = self.radii.y;
+
+        // A = diag(sx, sy) * R(theta)
+        let a00 = sx * theta.cos();
+        let a01 = -sx * theta.sin();
+        let a10 = sy * theta.sin();
+        let a11 = sy * theta.cos();
+        // B = A * diag(a, b)
+        let b00 = a00 * a;
+        let b01 = a01 * b;
+        let b10 = a10 * a;
+        let b11 = a11 * b;
+        // M = R(phi) * B
+        let cos_phi = phi.cos();
+        let sin_phi = phi.sin();
+        let m00 = cos_phi * b00 - sin_phi * b10;
+        let m01 = cos_phi * b01 - sin_phi * b11;
+        let m10 = sin_phi * b00 + cos_phi * b10;
+        let m11 = sin_phi * b01 + cos_phi * b11;
+
+        // S = M * M^T (symmetric 2x2)
+        let s00 = m00 * m00 + m01 * m01;
+        let s01 = m00 * m10 + m01 * m11;
+        let s11 = m10 * m10 + m11 * m11;
+
+        // Eigenvalues of S.
+        let tr = s00 + s11;
+        let det_s = s00 * s11 - s01 * s01;
+        let disc = ((tr / 2.0).powi(2) - det_s).max(0.0);
+        let sqrt_disc = disc.sqrt();
+        let lambda_max = tr / 2.0 + sqrt_disc;
+        let lambda_min = tr / 2.0 - sqrt_disc;
+
+        let tol_sq = tol.absolute * tol.absolute;
+        if lambda_max <= tol_sq {
+            return Err(GeometryError::Degenerate(
+                "transform collapses ellipse to a point",
+            ));
         }
+        if lambda_min <= tol_sq {
+            return Err(GeometryError::Degenerate(
+                "transform collapses ellipse to a line segment",
+            ));
+        }
+
+        let new_rx = lambda_max.sqrt();
+        let new_ry = lambda_min.sqrt();
+
+        // Eigenvector for lambda_max: for [[s00, s01], [s01, s11]], the
+        // eigenvector for the larger eigenvalue is (s01, lambda_max - s00)
+        // when s01 != 0; angle = atan2(s01, lambda_max - s11).
+        let new_rotation = if s01.abs() > tol.absolute {
+            s01.atan2(lambda_max - s11)
+        } else if s00 >= s11 {
+            0.0
+        } else {
+            std::f64::consts::FRAC_PI_2
+        };
+
+        let new_center = transform.apply_point(&self.center);
+        Ellipse2::new(
+            new_center,
+            Vector2::new_unchecked(new_rx, new_ry),
+            new_rotation,
+        )
     }
 }
 
@@ -265,14 +322,14 @@ impl DistanceTo2<Point2> for Ellipse2 {
 }
 
 impl Project2 for Ellipse2 {
-    fn project_point(&self, point: &Point2) -> Point2 {
+    fn project_point(&self, point: &Point2, _tol: Tolerance) -> Point2 {
         self.project_point(point)
     }
 }
 
 impl Contains2<Point2> for Ellipse2 {
-    fn contains(&self, rhs: &Point2) -> bool {
-        self.contains_point(rhs, Tolerance::DEFAULT)
+    fn contains(&self, rhs: &Point2, tol: Tolerance) -> bool {
+        self.contains_point(rhs, tol)
     }
 }
 
@@ -476,6 +533,51 @@ mod tests {
     }
 
     #[test]
+    // Evidence: WO-002-AC04 — rotated-ellipse bounding box is the exact
+    // analytical AABB (not the 4-local-cardinal-angle sampling, which
+    // under-bounds after rotation).
+    fn bounding_box_rotated_ellipse_is_tight_and_contains_curve() {
+        for rot in [
+            0.0,
+            std::f64::consts::FRAC_PI_6,
+            std::f64::consts::FRAC_PI_4,
+            std::f64::consts::FRAC_PI_3,
+            std::f64::consts::FRAC_PI_2,
+            1.7,
+        ] {
+            let e = Ellipse2::new(
+                Point2::new(0.5, -0.3).unwrap(),
+                Vector2::new(2.0, 1.0).unwrap(),
+                rot,
+            )
+            .unwrap();
+            let bb = e.bounding_box();
+            // (a) The curve is contained in the bbox: sample 256 angles.
+            for i in 0..256 {
+                let ang = (i as f64) * std::f64::consts::TAU / 256.0;
+                let p = e.point_at_angle(ang);
+                assert!(p.x >= bb.min.x - 1e-9, "x={p:?} < min.x={bb:?} (rot={rot})");
+                assert!(p.x <= bb.max.x + 1e-9, "x={p:?} > max.x={bb:?} (rot={rot})");
+                assert!(p.y >= bb.min.y - 1e-9, "y={p:?} < min.y={bb:?} (rot={rot})");
+                assert!(p.y <= bb.max.y + 1e-9, "y={p:?} > max.y={bb:?} (rot={rot})");
+            }
+            // (b) The bbox extents exactly match the analytical formula.
+            let cos = rot.cos();
+            let sin = rot.sin();
+            let exp_half_w = ((2.0 * cos).powi(2) + (1.0 * sin).powi(2)).sqrt();
+            let exp_half_h = ((2.0 * sin).powi(2) + (1.0 * cos).powi(2)).sqrt();
+            assert!(
+                approx(bb.max.x - e.center.x, exp_half_w),
+                "half-width mismatch at rot={rot}"
+            );
+            assert!(
+                approx(bb.max.y - e.center.y, exp_half_h),
+                "half-height mismatch at rot={rot}"
+            );
+        }
+    }
+
+    #[test]
     fn transform_identity_preserves_ellipse() {
         // Evidence: WO-002-AC04 — identity transform invariance.
         let e = Ellipse2::new(
@@ -484,12 +586,103 @@ mod tests {
             0.5,
         )
         .unwrap();
-        let t = e.transform(&Transform2D::identity());
+        let t = e
+            .transform(&Transform2D::identity(), Tolerance::DEFAULT)
+            .unwrap();
         assert!(approx(t.center.x, 1.0));
         assert!(approx(t.center.y, 2.0));
-        assert!(approx(t.radii.x, 3.0));
-        assert!(approx(t.radii.y, 4.0));
-        assert!(approx(t.rotation_rad, 0.5));
+        // For identity, the radii and rotation are preserved (the
+        // eigendecomposition may choose an equivalent (radii, rotation)
+        // pair — the ellipse AS A SET is identical; check via sampling).
+        for ang in [0.0, 1.0, 2.0, 3.0, 5.0] {
+            let p = e.point_at_angle(ang);
+            assert!(t.contains_point(&p, Tolerance::new(1e-6).unwrap()));
+        }
+    }
+
+    #[test]
+    fn ellipse_transform_uniform_scale_and_rotate_exact() {
+        // Evidence: WO-002-AC02 — exact image ellipse under uniform
+        // scale + rotation: transformed curve points lie on the new ellipse.
+        let e = Ellipse2::new(
+            Point2::new(0.0, 0.0).unwrap(),
+            Vector2::new(2.0, 1.0).unwrap(),
+            0.3,
+        )
+        .unwrap();
+        let t = Transform2D::new(Vector2::new(1.0, 1.0).unwrap(), 0.5, 2.0, 2.0).unwrap();
+        let img = e.transform(&t, Tolerance::DEFAULT).unwrap();
+        let loose = Tolerance::new(1e-6).unwrap();
+        for i in 0..32 {
+            let ang = (i as f64) * std::f64::consts::TAU / 32.0;
+            let p = e.point_at_angle(ang);
+            let tp = t.apply_point(&p);
+            assert!(
+                img.contains_point(&tp, loose),
+                "transformed point {tp:?} not on image ellipse {img:?} (ang={ang})"
+            );
+        }
+    }
+
+    #[test]
+    fn ellipse_transform_non_uniform_scale_axis_aligned_exact() {
+        // Evidence: WO-002-AC02 — axis-aligned ellipse under non-uniform
+        // scale (no rotation in either) is exactly representable. The
+        // eigendecomposition may produce an equivalent (radii, rotation)
+        // pair (e.g. rotation π/2 with swapped radii); verify by sampling
+        // that the image ellipse AS A SET is correct.
+        let e = Ellipse2::new(Point2::ORIGIN, Vector2::new(2.0, 3.0).unwrap(), 0.0).unwrap();
+        let t = Transform2D::scaling(2.0, 5.0);
+        let img = e.transform(&t, Tolerance::DEFAULT).unwrap();
+        // The image should have semi-axes 4 and 15 (in some order/rotation).
+        let big = img.radii.x.max(img.radii.y);
+        let small = img.radii.x.min(img.radii.y);
+        assert!(approx(big, 15.0));
+        assert!(approx(small, 4.0));
+        // Verify by sampling that transformed curve points lie on the image.
+        let loose = Tolerance::new(1e-6).unwrap();
+        for i in 0..32 {
+            let ang = (i as f64) * std::f64::consts::TAU / 32.0;
+            let p = e.point_at_angle(ang);
+            let tp = t.apply_point(&p);
+            assert!(img.contains_point(&tp, loose));
+        }
+    }
+
+    #[test]
+    fn ellipse_transform_singular_rejected() {
+        // Evidence: WO-002-AC03 — singular transform collapses the ellipse
+        // to a line/point; explicitly rejected.
+        let e = Ellipse2::new(Point2::ORIGIN, Vector2::new(2.0, 1.0).unwrap(), 0.0).unwrap();
+        let t = Transform2D::scaling(0.0, 1.0);
+        let err = e.transform(&t, Tolerance::DEFAULT).unwrap_err();
+        assert!(matches!(err, GeometryError::Degenerate(_)));
+    }
+
+    #[test]
+    fn ellipse_transform_non_uniform_and_rotated_still_representable() {
+        // Evidence: WO-002-AC02 — non-uniform scale + rotation on a
+        // rotated ellipse still produces a representable image ellipse
+        // (the image of an ellipse under any non-singular affine is an
+        // ellipse). Verify by sampling.
+        let e = Ellipse2::new(
+            Point2::new(0.0, 0.0).unwrap(),
+            Vector2::new(2.0, 1.0).unwrap(),
+            0.3,
+        )
+        .unwrap();
+        let t = Transform2D::new(Vector2::ZERO, 0.5, 2.0, 3.0).unwrap();
+        let img = e.transform(&t, Tolerance::DEFAULT).unwrap();
+        let loose = Tolerance::new(1e-6).unwrap();
+        for i in 0..32 {
+            let ang = (i as f64) * std::f64::consts::TAU / 32.0;
+            let p = e.point_at_angle(ang);
+            let tp = t.apply_point(&p);
+            assert!(
+                img.contains_point(&tp, loose),
+                "transformed point {tp:?} not on image ellipse {img:?} (ang={ang})"
+            );
+        }
     }
 
     #[test]
