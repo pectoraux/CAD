@@ -10,17 +10,45 @@ use crate::point::Point2;
 use crate::tolerance::Tolerance;
 use crate::transform::Transform2D;
 use crate::vector::Vector2;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Serialize,
+    de::{self, Deserializer},
+};
 
 /// A 2D circle defined by a center and a positive radius. Zero-radius
-/// circles are rejected at construction as degenerate (a point is not a
-/// circle).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// circles are rejected at construction and at the deserialization
+/// canonical-model boundary as degenerate (a point is not a circle).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Circle2 {
     /// Center of the circle.
     pub center: Point2,
     /// Radius (positive, finite).
     pub radius: f64,
+}
+
+/// Private shadow struct used as the serde wire shape for [`Circle2`].
+#[derive(Deserialize)]
+struct RawCircle2 {
+    center: Point2,
+    radius: f64,
+}
+
+impl TryFrom<RawCircle2> for Circle2 {
+    type Error = GeometryError;
+
+    fn try_from(r: RawCircle2) -> Result<Self, Self::Error> {
+        Self::new(r.center, r.radius)
+    }
+}
+
+impl<'de> Deserialize<'de> for Circle2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawCircle2::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(de::Error::custom)
+    }
 }
 
 impl Circle2 {
@@ -76,10 +104,12 @@ impl Circle2 {
         (self.center.distance_to(*p) - self.radius).abs()
     }
 
-    /// Returns `true` if `p` lies on the circle curve within `tolerance`.
+    /// Returns `true` if `p` lies on the circle curve within the canonical
+    /// tolerance policy
+    /// ([`Tolerance::CANONICAL`](crate::tolerance::Tolerance::CANONICAL)).
     #[must_use]
-    pub fn contains_point(&self, p: &Point2, tolerance: Tolerance) -> bool {
-        self.distance_to_point(p) <= tolerance.absolute
+    pub fn contains_point(&self, p: &Point2) -> bool {
+        self.distance_to_point(p) <= Tolerance::CANONICAL.absolute()
     }
 
     /// Returns `true` if `p` lies inside the closed disk bounded by the
@@ -132,15 +162,17 @@ impl Transformable2 for Circle2 {
     /// by `|scale_x|` (== `|scale_y|` for representable cases).
     ///
     /// Returns `Err(GeometryError::Degenerate(_))` when `transform` has
-    /// non-uniform scale (`|scale_x| != |scale_y|` within `tol`): the image
-    /// of a circle under non-uniform scaling is an ellipse, which is not
-    /// representable in the frozen `Circle2` form. Also returns `Err` when
-    /// the transform is singular and collapses the circle to a point
-    /// (zero-radius result is rejected by `Circle2::new`).
+    /// non-uniform scale (`|scale_x| != |scale_y|` within the canonical
+    /// tolerance policy): the image of a circle under non-uniform scaling
+    /// is an ellipse, which is not representable in the frozen `Circle2`
+    /// form. Also returns `Err` when the transform is singular and
+    /// collapses the circle to a point (zero-radius result is rejected by
+    /// `Circle2::new`).
     ///
     /// Evidence: WO-002-AC03 — non-representable images explicitly rejected
     /// rather than silently approximated.
-    fn transform(&self, transform: &Transform2D, tol: Tolerance) -> Result<Self, GeometryError> {
+    fn transform(&self, transform: &Transform2D) -> Result<Self, GeometryError> {
+        let tol = Tolerance::CANONICAL;
         if !tol.eq(transform.scale_x.abs(), transform.scale_y.abs()) {
             return Err(GeometryError::Degenerate(
                 "non-uniform scale cannot be represented as a circle (frozen Circle2 form)",
@@ -159,39 +191,40 @@ impl DistanceTo2<Point2> for Circle2 {
 }
 
 impl Project2 for Circle2 {
-    fn project_point(&self, point: &Point2, _tol: Tolerance) -> Point2 {
+    fn project_point(&self, point: &Point2) -> Point2 {
         self.project_point(point)
     }
 }
 
 impl Contains2<Point2> for Circle2 {
-    fn contains(&self, rhs: &Point2, tol: Tolerance) -> bool {
-        self.contains_point(rhs, tol)
+    fn contains(&self, rhs: &Point2) -> bool {
+        self.contains_point(rhs)
     }
 }
 
 impl Intersect2<Circle2> for Circle2 {
-    fn intersect(&self, rhs: &Circle2, tolerance: Tolerance) -> Intersection2 {
+    fn intersect(&self, rhs: &Circle2) -> Intersection2 {
+        let tolerance = Tolerance::CANONICAL;
         let d = self.center.distance_to(rhs.center);
         let r_sum = self.radius + rhs.radius;
         let r_diff = (self.radius - rhs.radius).abs();
-        if d > r_sum + tolerance.absolute {
+        if d > r_sum + tolerance.absolute() {
             return Intersection2::Empty;
         }
-        if d < r_diff - tolerance.absolute {
+        if d < r_diff - tolerance.absolute() {
             return Intersection2::Empty; // one inside the other, no contact
         }
         // Coincident (same center and radius)
-        if d <= tolerance.absolute && (self.radius - rhs.radius).abs() <= tolerance.absolute {
+        if d <= tolerance.absolute() && (self.radius - rhs.radius).abs() <= tolerance.absolute() {
             return Intersection2::Coincident;
         }
         // Tangent (external or internal)
-        if (d - r_sum).abs() <= tolerance.absolute || (d - r_diff).abs() <= tolerance.absolute {
+        if (d - r_sum).abs() <= tolerance.absolute() || (d - r_diff).abs() <= tolerance.absolute() {
             // Single tangent point along the line of centers.
-            let dir = if d > tolerance.absolute {
+            let dir = if d > tolerance.absolute() {
                 self.center
                     .vector_to(rhs.center)
-                    .normalize_with(tolerance)
+                    .normalize()
                     .unwrap_or(Vector2::I)
             } else {
                 Vector2::I
@@ -212,16 +245,18 @@ impl Intersect2<Circle2> for Circle2 {
         let h_sq = (self.radius * self.radius - a * a * d * d).max(0.0);
         let h = h_sq.sqrt();
         // Perpendicular direction (unit) to the line of centers.
-        let axis = if d > tolerance.absolute {
+        let axis = if d > tolerance.absolute() {
             self.center.vector_to(rhs.center)
         } else {
             Vector2::I
         };
         let perp = Vector2::new_unchecked(-axis.y, axis.x);
-        let pn = perp.normalize_with(tolerance).unwrap_or(Vector2::J);
+        let pn = perp.normalize().unwrap_or(Vector2::J);
         let p1 = Point2::new_unchecked(px + pn.x * h, py + pn.y * h);
         let p2 = Point2::new_unchecked(px - pn.x * h, py - pn.y * h);
-        if (p1.x - p2.x).abs() <= tolerance.absolute && (p1.y - p2.y).abs() <= tolerance.absolute {
+        if (p1.x - p2.x).abs() <= tolerance.absolute()
+            && (p1.y - p2.y).abs() <= tolerance.absolute()
+        {
             Intersection2::Point(p1)
         } else {
             Intersection2::Points(vec![p1, p2])
@@ -230,14 +265,15 @@ impl Intersect2<Circle2> for Circle2 {
 }
 
 impl Intersect2<Line2> for Circle2 {
-    fn intersect(&self, rhs: &Line2, tolerance: Tolerance) -> Intersection2 {
+    fn intersect(&self, rhs: &Line2) -> Intersection2 {
+        let tolerance = Tolerance::CANONICAL;
         // Distance from center to line; compare with radius.
         let dist = rhs.distance_to_point(&self.center);
-        if dist > self.radius + tolerance.absolute {
+        if dist > self.radius + tolerance.absolute() {
             return Intersection2::Empty;
         }
         let perp = rhs.project_point(&self.center);
-        if (dist - self.radius).abs() <= tolerance.absolute {
+        if (dist - self.radius).abs() <= tolerance.absolute() {
             return Intersection2::Point(perp);
         }
         // Two points: along the line at ±sqrt(r^2 - d^2) from perp.
@@ -250,7 +286,7 @@ impl Intersect2<Line2> for Circle2 {
 }
 
 impl Intersect2<LineSegment2> for Circle2 {
-    fn intersect(&self, rhs: &LineSegment2, tolerance: Tolerance) -> Intersection2 {
+    fn intersect(&self, rhs: &LineSegment2) -> Intersection2 {
         // Clip the segment to the circle.
         // Parameterize the segment: p(t) = start + t*(end-start), t in [0,1].
         // |start - center + t*d|^2 = r^2, where d = end - start.
@@ -258,16 +294,17 @@ impl Intersect2<LineSegment2> for Circle2 {
         // (f' + t*d).dot(f' + t*d) = r^2
         // f'.dot(f') + 2 t (f'.dot(d)) + t^2 d.dot(d) = r^2
         // a t^2 + b t + c = 0 where a = d.dot(d), b = 2 f'.dot(d), c = f'.dot(f') - r^2.
+        let tolerance = Tolerance::CANONICAL;
         let d = rhs.start.vector_to(rhs.end);
         let fp = self.center.vector_to(rhs.start); // start - center
         let a = d.dot(d);
         let b = 2.0 * fp.dot(d);
         let c = fp.dot(fp) - self.radius * self.radius;
         let disc = b * b - 4.0 * a * c;
-        if disc < -tolerance.absolute {
+        if disc < -tolerance.absolute() {
             return Intersection2::Empty;
         }
-        if disc.abs() <= tolerance.absolute {
+        if disc.abs() <= tolerance.absolute() {
             // Tangent
             let t = -b / (2.0 * a);
             if (0.0..=1.0).contains(&t) {
@@ -307,8 +344,9 @@ impl Intersect2<LineSegment2> for Circle2 {
 /// A 2D circular arc defined by center, radius, start angle, and sweep.
 ///
 /// The sweep is in `(-2π, 2π]`. Positive sweep is CCW; negative is CW. A
-/// zero-sweep arc is degenerate and rejected at construction.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// zero-sweep arc is degenerate and rejected at construction and at the
+/// deserialization canonical-model boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Arc2 {
     /// Center of the arc's circle.
     pub center: Point2,
@@ -318,6 +356,36 @@ pub struct Arc2 {
     pub start_angle: f64,
     /// Sweep angle in radians (sign indicates direction).
     pub sweep_angle: f64,
+}
+
+/// Private shadow struct used as the serde wire shape for [`Arc2`].
+#[derive(Deserialize)]
+struct RawArc2 {
+    center: Point2,
+    radius: f64,
+    start_angle: f64,
+    sweep_angle: f64,
+}
+
+impl TryFrom<RawArc2> for Arc2 {
+    type Error = GeometryError;
+
+    fn try_from(r: RawArc2) -> Result<Self, Self::Error> {
+        // Re-normalize the sweep at the canonical boundary so a wire value
+        // with a non-canonical sweep is canonicalized (and a zero / invalid
+        // sweep is rejected as degenerate).
+        Self::new(r.center, r.radius, r.start_angle, r.sweep_angle)
+    }
+}
+
+impl<'de> Deserialize<'de> for Arc2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawArc2::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(de::Error::custom)
+    }
 }
 
 impl Arc2 {
@@ -452,10 +520,12 @@ impl Arc2 {
         self.project_point(p).distance_to(*p)
     }
 
-    /// Returns `true` if `p` lies on the arc curve within `tolerance`.
+    /// Returns `true` if `p` lies on the arc curve within the canonical
+    /// tolerance policy
+    /// ([`Tolerance::CANONICAL`](crate::tolerance::Tolerance::CANONICAL)).
     #[must_use]
-    pub fn contains_point(&self, p: &Point2, tolerance: Tolerance) -> bool {
-        self.distance_to_point(p) <= tolerance.absolute
+    pub fn contains_point(&self, p: &Point2) -> bool {
+        self.distance_to_point(p) <= Tolerance::CANONICAL.absolute()
     }
 }
 
@@ -503,14 +573,16 @@ impl Transformable2 for Arc2 {
     /// Transform the arc's center, radius, and angles by `transform`.
     ///
     /// Returns `Err(GeometryError::Degenerate(_))` when `transform` has
-    /// non-uniform scale (`|scale_x| != |scale_y|` within `tol`): the image
-    /// of a circular arc under non-uniform scaling is an elliptic arc, not
-    /// representable in the frozen `Arc2` form. Reflection (sign-flip of
-    /// exactly one scale) is handled correctly (sweep sign flips).
+    /// non-uniform scale (`|scale_x| != |scale_y|` within the canonical
+    /// tolerance policy): the image of a circular arc under non-uniform
+    /// scaling is an elliptic arc, not representable in the frozen `Arc2`
+    /// form. Reflection (sign-flip of exactly one scale) is handled
+    /// correctly (sweep sign flips).
     ///
     /// Evidence: WO-002-AC03 — non-representable images explicitly rejected
     /// rather than silently approximated.
-    fn transform(&self, transform: &Transform2D, tol: Tolerance) -> Result<Self, GeometryError> {
+    fn transform(&self, transform: &Transform2D) -> Result<Self, GeometryError> {
+        let tol = Tolerance::CANONICAL;
         if !tol.eq(transform.scale_x.abs(), transform.scale_y.abs()) {
             return Err(GeometryError::Degenerate(
                 "non-uniform scale cannot be represented as an arc (frozen Arc2 form)",
@@ -542,31 +614,33 @@ impl DistanceTo2<Point2> for Arc2 {
 }
 
 impl Project2 for Arc2 {
-    fn project_point(&self, point: &Point2, _tol: Tolerance) -> Point2 {
+    fn project_point(&self, point: &Point2) -> Point2 {
         self.project_point(point)
     }
 }
 
 impl Contains2<Point2> for Arc2 {
-    fn contains(&self, rhs: &Point2, tol: Tolerance) -> bool {
-        self.contains_point(rhs, tol)
+    fn contains(&self, rhs: &Point2) -> bool {
+        self.contains_point(rhs)
     }
 }
 
 impl Intersect2<Line2> for Arc2 {
-    fn intersect(&self, rhs: &Line2, tolerance: Tolerance) -> Intersection2 {
+    fn intersect(&self, rhs: &Line2) -> Intersection2 {
         // Circle-line intersections, filtered by arc angular range.
+        let tolerance = Tolerance::CANONICAL;
         let circle = Circle2 {
             center: self.center,
             radius: self.radius,
         };
-        let hits = match circle.intersect(rhs, tolerance) {
+        let hits = match circle.intersect(rhs) {
             Intersection2::Point(p) => vec![p],
             Intersection2::Points(ps) => ps,
             Intersection2::Coincident => return Intersection2::Coincident,
             // `Empty` is propagated; `Segment(_)` is impossible for circle-line.
             Intersection2::Empty | Intersection2::Segment(_) => return Intersection2::Empty,
         };
+        let _ = tolerance;
         let mut out: Vec<Point2> = hits
             .into_iter()
             .filter(|p| self.contains_angle((p.y - self.center.y).atan2(p.x - self.center.x)))
@@ -580,17 +654,19 @@ impl Intersect2<Line2> for Arc2 {
 }
 
 impl Intersect2<LineSegment2> for Arc2 {
-    fn intersect(&self, rhs: &LineSegment2, tolerance: Tolerance) -> Intersection2 {
+    fn intersect(&self, rhs: &LineSegment2) -> Intersection2 {
+        let tolerance = Tolerance::CANONICAL;
         let circle = Circle2 {
             center: self.center,
             radius: self.radius,
         };
-        let hits = match circle.intersect(rhs, tolerance) {
+        let hits = match circle.intersect(rhs) {
             Intersection2::Point(p) => vec![p],
             Intersection2::Points(ps) => ps,
             Intersection2::Coincident => return Intersection2::Coincident,
             Intersection2::Empty | Intersection2::Segment(_) => return Intersection2::Empty,
         };
+        let _ = tolerance;
         let mut out: Vec<Point2> = hits
             .into_iter()
             .filter(|p| self.contains_angle((p.y - self.center.y).atan2(p.x - self.center.x)))
@@ -604,12 +680,13 @@ impl Intersect2<LineSegment2> for Arc2 {
 }
 
 impl Intersect2<Circle2> for Arc2 {
-    fn intersect(&self, rhs: &Circle2, tolerance: Tolerance) -> Intersection2 {
+    fn intersect(&self, rhs: &Circle2) -> Intersection2 {
+        let tolerance = Tolerance::CANONICAL;
         let circle = Circle2 {
             center: self.center,
             radius: self.radius,
         };
-        let hits = match circle.intersect(rhs, tolerance) {
+        let hits = match circle.intersect(rhs) {
             Intersection2::Point(p) => vec![p],
             Intersection2::Points(ps) => ps,
             Intersection2::Coincident => {
@@ -620,6 +697,7 @@ impl Intersect2<Circle2> for Arc2 {
             }
             Intersection2::Empty | Intersection2::Segment(_) => return Intersection2::Empty,
         };
+        let _ = tolerance;
         let mut out: Vec<Point2> = hits
             .into_iter()
             .filter(|p| self.contains_angle((p.y - self.center.y).atan2(p.x - self.center.x)))
@@ -636,7 +714,8 @@ impl Intersect2<Circle2> for Arc2 {
 mod tests {
     // Evidence: WO-002-AC01 — Circle2 / Arc2 serde round-trip.
     // Evidence: WO-002-AC02 — circle-circle intersection determinism.
-    // Evidence: WO-002-AC03 — zero-radius rejected; zero-sweep arc rejected.
+    // Evidence: WO-002-AC03 — zero-radius rejected; zero-sweep arc rejected;
+    // NaN/Inf rejected at the deserialization canonical-model boundary.
     // Evidence: WO-002-AC04 — circle contains its center (disk); projection on circle.
     use super::*;
     use crate::line::Line2;
@@ -688,7 +767,7 @@ mod tests {
     #[test]
     fn circle_contains_curve_excludes_center() {
         let c = Circle2::new(Point2::new(1.0, 2.0).unwrap(), 3.0).unwrap();
-        assert!(!c.contains(&c.center, Tolerance::DEFAULT));
+        assert!(!c.contains(&c.center));
     }
 
     #[test]
@@ -699,7 +778,7 @@ mod tests {
             Point2::new(2.0, 0.0).unwrap(),
         )
         .unwrap();
-        match c.intersect(&l, Tolerance::DEFAULT) {
+        match c.intersect(&l) {
             Intersection2::Points(ps) => {
                 assert_eq!(ps.len(), 2);
                 let xs: Vec<f64> = ps.iter().map(|p| p.x).collect();
@@ -715,7 +794,7 @@ mod tests {
         // Evidence: WO-002-AC02 — circle-circle intersection determinism.
         let c1 = Circle2::new(Point2::new(0.0, 0.0).unwrap(), 1.0).unwrap();
         let c2 = Circle2::new(Point2::new(1.5, 0.0).unwrap(), 1.0).unwrap();
-        match c1.intersect(&c2, Tolerance::DEFAULT) {
+        match c1.intersect(&c2) {
             Intersection2::Points(ps) => {
                 assert_eq!(ps.len(), 2);
                 for p in &ps {
@@ -731,24 +810,21 @@ mod tests {
     fn circle_circle_disjoint_is_empty() {
         let c1 = Circle2::new(Point2::new(0.0, 0.0).unwrap(), 1.0).unwrap();
         let c2 = Circle2::new(Point2::new(10.0, 0.0).unwrap(), 1.0).unwrap();
-        assert_eq!(c1.intersect(&c2, Tolerance::DEFAULT), Intersection2::Empty);
+        assert_eq!(c1.intersect(&c2), Intersection2::Empty);
     }
 
     #[test]
     fn circle_circle_coincident() {
         let c1 = Circle2::new(Point2::new(0.0, 0.0).unwrap(), 1.0).unwrap();
         let c2 = Circle2::new(Point2::new(0.0, 0.0).unwrap(), 1.0).unwrap();
-        assert_eq!(
-            c1.intersect(&c2, Tolerance::DEFAULT),
-            Intersection2::Coincident
-        );
+        assert_eq!(c1.intersect(&c2), Intersection2::Coincident);
     }
 
     #[test]
     fn circle_circle_tangent() {
         let c1 = Circle2::new(Point2::new(0.0, 0.0).unwrap(), 1.0).unwrap();
         let c2 = Circle2::new(Point2::new(2.0, 0.0).unwrap(), 1.0).unwrap();
-        match c1.intersect(&c2, Tolerance::DEFAULT) {
+        match c1.intersect(&c2) {
             Intersection2::Point(p) => {
                 assert!(approx(p.x, 1.0));
                 assert!(approx(p.y, 0.0));
@@ -800,9 +876,7 @@ mod tests {
     fn transform_identity_preserves_circle() {
         // Evidence: WO-002-AC04 — identity transform invariance.
         let c = Circle2::new(Point2::new(1.0, 2.0).unwrap(), 3.0).unwrap();
-        let t = c
-            .transform(&Transform2D::identity(), Tolerance::DEFAULT)
-            .unwrap();
+        let t = c.transform(&Transform2D::identity()).unwrap();
         assert!(approx(t.center.x, 1.0));
         assert!(approx(t.center.y, 2.0));
         assert!(approx(t.radius, 3.0));
@@ -814,7 +888,7 @@ mod tests {
         // the image circle has the transformed center and radius * |scale|.
         let c = Circle2::new(Point2::new(1.0, 1.0).unwrap(), 2.0).unwrap();
         let t = Transform2D::new(Vector2::new(1.0, 0.0).unwrap(), 0.5, 3.0, 3.0).unwrap();
-        let img = c.transform(&t, Tolerance::DEFAULT).unwrap();
+        let img = c.transform(&t).unwrap();
         assert!(approx(img.center.x, t.apply_point(&c.center).x));
         assert!(approx(img.center.y, t.apply_point(&c.center).y));
         assert!(approx(img.radius, 6.0));
@@ -826,7 +900,7 @@ mod tests {
         // not representable as Circle2; explicitly rejected.
         let c = Circle2::new(Point2::ORIGIN, 2.0).unwrap();
         let t = Transform2D::scaling(2.0, 3.0);
-        let err = c.transform(&t, Tolerance::DEFAULT).unwrap_err();
+        let err = c.transform(&t).unwrap_err();
         assert!(matches!(err, GeometryError::Degenerate(_)));
     }
 
@@ -836,7 +910,7 @@ mod tests {
         // transformed endpoint positions (uniform scale + rotation case).
         let a = Arc2::new(Point2::ORIGIN, 1.0, 0.0, std::f64::consts::FRAC_PI_2).unwrap();
         let t = Transform2D::new(Vector2::ZERO, std::f64::consts::FRAC_PI_4, 2.0, 2.0).unwrap();
-        let img = a.transform(&t, Tolerance::DEFAULT).unwrap();
+        let img = a.transform(&t).unwrap();
         let new_start = img.start_point();
         let new_end = img.end_point();
         let exp_start = t.apply_point(&a.start_point());
@@ -853,7 +927,7 @@ mod tests {
         // scale) flips the sweep direction.
         let a = Arc2::new(Point2::ORIGIN, 1.0, 0.0, std::f64::consts::FRAC_PI_2).unwrap();
         let t = Transform2D::scaling(1.0, -1.0); // reflection across x-axis
-        let img = a.transform(&t, Tolerance::DEFAULT).unwrap();
+        let img = a.transform(&t).unwrap();
         assert!(approx(img.sweep_angle, -a.sweep_angle));
     }
 
@@ -863,7 +937,7 @@ mod tests {
         // arc, not representable as Arc2.
         let a = Arc2::new(Point2::ORIGIN, 1.0, 0.0, std::f64::consts::FRAC_PI_2).unwrap();
         let t = Transform2D::scaling(2.0, 3.0);
-        let err = a.transform(&t, Tolerance::DEFAULT).unwrap_err();
+        let err = a.transform(&t).unwrap_err();
         assert!(matches!(err, GeometryError::Degenerate(_)));
     }
 
@@ -909,6 +983,9 @@ mod tests {
 
     #[test]
     fn validate_rejects_deserialized_zero_radius() {
+        // Direct struct-literal construction (test-only path; not a
+        // canonical-model boundary) can still produce a zero-radius value;
+        // `validate()` is the explicit check for such values.
         let bad = Circle2 {
             center: Point2::ORIGIN,
             radius: 0.0,

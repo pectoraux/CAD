@@ -9,7 +9,10 @@ use crate::point::Point2;
 use crate::tolerance::Tolerance;
 use crate::transform::Transform2D;
 use crate::vector::Vector2;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Serialize,
+    de::{self, Deserializer},
+};
 
 // ---------------------------------------------------------------------------
 // Infinite line
@@ -21,12 +24,43 @@ use serde::{Deserialize, Serialize};
 /// `Line2` is intentionally NOT [`Bounded2`] — an infinite primitive has no
 /// finite axis-aligned bounding box. If a conservative bound is needed, take
 /// the bounding box of an [`LineSegment2`] clipped to the region of interest.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Line2 {
     /// A point on the line.
     pub point: Point2,
     /// Unit direction along the line.
     pub direction: Vector2,
+}
+
+/// Private shadow struct used as the serde wire shape for [`Line2`].
+/// Carries the raw (unvalidated) field values; the `TryFrom` impl on
+/// `Line2` enforces the finiteness + non-zero direction invariant at the
+/// deserialization canonical-model boundary.
+#[derive(Deserialize)]
+struct RawLine2 {
+    point: Point2,
+    direction: Vector2,
+}
+
+impl TryFrom<RawLine2> for Line2 {
+    type Error = GeometryError;
+
+    fn try_from(r: RawLine2) -> Result<Self, Self::Error> {
+        // Re-normalize the direction at the canonical boundary so a wire
+        // value with a non-unit direction is canonicalized (and a zero
+        // direction is rejected as degenerate).
+        Self::new(r.point, r.direction)
+    }
+}
+
+impl<'de> Deserialize<'de> for Line2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawLine2::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(de::Error::custom)
+    }
 }
 
 impl Line2 {
@@ -85,10 +119,12 @@ impl Line2 {
         cross
     }
 
-    /// Returns `true` if `p` lies on the line within `tolerance`.
+    /// Returns `true` if `p` lies on the line within the canonical
+    /// tolerance policy
+    /// ([`Tolerance::CANONICAL`](crate::tolerance::Tolerance::CANONICAL)).
     #[must_use]
-    pub fn contains_point(&self, p: &Point2, tolerance: Tolerance) -> bool {
-        self.distance_to_point(p) <= tolerance.absolute
+    pub fn contains_point(&self, p: &Point2) -> bool {
+        self.distance_to_point(p) <= Tolerance::CANONICAL.absolute()
     }
 
     /// Parameter `t` such that `point + direction * t == p_projected`.
@@ -99,7 +135,7 @@ impl Line2 {
 }
 
 impl Transformable2 for Line2 {
-    fn transform(&self, transform: &Transform2D, _tol: Tolerance) -> Result<Self, GeometryError> {
+    fn transform(&self, transform: &Transform2D) -> Result<Self, GeometryError> {
         let p = transform.apply_point(&self.point);
         let d = transform.apply_vector(&self.direction);
         // The transformed direction may be zero if the transform is singular
@@ -126,23 +162,24 @@ impl DistanceTo2<Point2> for Line2 {
 }
 
 impl Project2 for Line2 {
-    fn project_point(&self, point: &Point2, _tol: Tolerance) -> Point2 {
+    fn project_point(&self, point: &Point2) -> Point2 {
         self.project_point(point)
     }
 }
 
 impl Contains2<Point2> for Line2 {
-    fn contains(&self, rhs: &Point2, tol: Tolerance) -> bool {
-        self.contains_point(rhs, tol)
+    fn contains(&self, rhs: &Point2) -> bool {
+        self.contains_point(rhs)
     }
 }
 
 impl Intersect2<Line2> for Line2 {
-    fn intersect(&self, rhs: &Line2, tolerance: Tolerance) -> Intersection2 {
+    fn intersect(&self, rhs: &Line2) -> Intersection2 {
+        let tol = Tolerance::CANONICAL;
         let det = self.direction.cross(rhs.direction);
-        if det.abs() <= tolerance.absolute {
+        if det.abs() <= tol.absolute() {
             // Parallel. Coincident if rhs.point is on self.
-            if self.contains_point(&rhs.point, tolerance) {
+            if self.contains_point(&rhs.point) {
                 return Intersection2::Coincident;
             }
             return Intersection2::Empty;
@@ -160,22 +197,23 @@ impl Intersect2<Line2> for Line2 {
 }
 
 impl Intersect2<LineSegment2> for Line2 {
-    fn intersect(&self, rhs: &LineSegment2, tolerance: Tolerance) -> Intersection2 {
+    fn intersect(&self, rhs: &LineSegment2) -> Intersection2 {
         // Treat the segment as a finite parametric range. First line-line
         // intersection, then clip t to [0, 1].
+        let tol = Tolerance::CANONICAL;
         let seg_dir = rhs.start.vector_to(rhs.end);
         let det = self.direction.cross(seg_dir);
-        if det.abs() <= tolerance.absolute {
+        if det.abs() <= tol.absolute() {
             // Parallel. If the segment's start is on the line, the whole
             // segment lies on it (Coincident); otherwise Empty.
-            if self.contains_point(&rhs.start, tolerance) {
+            if self.contains_point(&rhs.start) {
                 return Intersection2::Coincident;
             }
             return Intersection2::Empty;
         }
         let w = self.point.vector_to(rhs.start);
         let t = w.cross(self.direction) / det; // segment parameter in [0,1]
-        if t < -tolerance.absolute || t > 1.0 + tolerance.absolute {
+        if t < -tol.absolute() || t > 1.0 + tol.absolute() {
             return Intersection2::Empty;
         }
         let tc = t.clamp(0.0, 1.0);
@@ -191,13 +229,39 @@ impl Intersect2<LineSegment2> for Line2 {
 // ---------------------------------------------------------------------------
 
 /// A finite line segment between two distinct points. Zero-length segments
-/// (where `start == end` exactly) are rejected at construction as degenerate.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// (where `start == end` exactly) are rejected at construction and at the
+/// deserialization canonical-model boundary as degenerate.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct LineSegment2 {
     /// Start endpoint.
     pub start: Point2,
     /// End endpoint.
     pub end: Point2,
+}
+
+/// Private shadow struct used as the serde wire shape for [`LineSegment2`].
+#[derive(Deserialize)]
+struct RawLineSegment2 {
+    start: Point2,
+    end: Point2,
+}
+
+impl TryFrom<RawLineSegment2> for LineSegment2 {
+    type Error = GeometryError;
+
+    fn try_from(r: RawLineSegment2) -> Result<Self, Self::Error> {
+        Self::new(r.start, r.end)
+    }
+}
+
+impl<'de> Deserialize<'de> for LineSegment2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawLineSegment2::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(de::Error::custom)
+    }
 }
 
 impl LineSegment2 {
@@ -277,10 +341,12 @@ impl LineSegment2 {
         self.project_point(point).distance_to(*point)
     }
 
-    /// Returns `true` if `point` lies on the segment (within `tolerance`).
+    /// Returns `true` if `point` lies on the segment within the canonical
+    /// tolerance policy
+    /// ([`Tolerance::CANONICAL`](crate::tolerance::Tolerance::CANONICAL)).
     #[must_use]
-    pub fn contains_point(&self, point: &Point2, tolerance: Tolerance) -> bool {
-        self.distance_to_point(point) <= tolerance.absolute
+    pub fn contains_point(&self, point: &Point2) -> bool {
+        self.distance_to_point(point) <= Tolerance::CANONICAL.absolute()
     }
 }
 
@@ -305,7 +371,7 @@ impl Bounded2 for LineSegment2 {
 }
 
 impl Transformable2 for LineSegment2 {
-    fn transform(&self, transform: &Transform2D, _tol: Tolerance) -> Result<Self, GeometryError> {
+    fn transform(&self, transform: &Transform2D) -> Result<Self, GeometryError> {
         let new_start = transform.apply_point(&self.start);
         let new_end = transform.apply_point(&self.end);
         // Route through `new` so a singular transform that collapses the
@@ -352,37 +418,38 @@ impl DistanceTo2<LineSegment2> for LineSegment2 {
 }
 
 impl Project2 for LineSegment2 {
-    fn project_point(&self, point: &Point2, _tol: Tolerance) -> Point2 {
+    fn project_point(&self, point: &Point2) -> Point2 {
         self.project_point(point)
     }
 }
 
 impl Contains2<Point2> for LineSegment2 {
-    fn contains(&self, rhs: &Point2, tol: Tolerance) -> bool {
-        self.contains_point(rhs, tol)
+    fn contains(&self, rhs: &Point2) -> bool {
+        self.contains_point(rhs)
     }
 }
 
 impl Intersect2<Line2> for LineSegment2 {
-    fn intersect(&self, rhs: &Line2, tolerance: Tolerance) -> Intersection2 {
+    fn intersect(&self, rhs: &Line2) -> Intersection2 {
         // Delegate: line.intersect(segment) is symmetric.
-        rhs.intersect(self, tolerance)
+        rhs.intersect(self)
     }
 }
 
 impl Intersect2<LineSegment2> for LineSegment2 {
-    fn intersect(&self, rhs: &LineSegment2, tolerance: Tolerance) -> Intersection2 {
+    fn intersect(&self, rhs: &LineSegment2) -> Intersection2 {
+        let tol = Tolerance::CANONICAL;
         let d1 = self.start.vector_to(self.end);
         let d2 = rhs.start.vector_to(rhs.end);
         let denom = d1.cross(d2);
         let r = self.start.vector_to(rhs.start);
 
-        if denom.abs() > tolerance.absolute {
+        if denom.abs() > tol.absolute() {
             // Not parallel. Solve for parameters.
             let t1 = r.cross(d2) / denom;
             let t2 = r.cross(d1) / denom;
-            let lo = -tolerance.absolute;
-            let hi = 1.0 + tolerance.absolute;
+            let lo = -tol.absolute();
+            let hi = 1.0 + tol.absolute();
             if t1 >= lo && t1 <= hi && t2 >= lo && t2 <= hi {
                 let tc = t1.clamp(0.0, 1.0);
                 return Intersection2::Point(Point2::new_unchecked(
@@ -394,8 +461,8 @@ impl Intersect2<LineSegment2> for LineSegment2 {
         }
 
         // Parallel or anti-parallel.
-        if r.length_squared() > tolerance.absolute * tolerance.absolute
-            && r.cross(d1).abs() > tolerance.absolute
+        if r.length_squared() > tol.absolute() * tol.absolute()
+            && r.cross(d1).abs() > tol.absolute()
         {
             // Parallel but NOT collinear: no intersection.
             return Intersection2::Empty;
@@ -407,7 +474,7 @@ impl Intersect2<LineSegment2> for LineSegment2 {
         if len_sq == 0.0 {
             // self is a degenerate point — should not happen because new()
             // rejects zero-length segments, but be defensive.
-            return if rhs.contains_point(&self.start, tolerance) {
+            return if rhs.contains_point(&self.start) {
                 Intersection2::Point(self.start)
             } else {
                 Intersection2::Empty
@@ -423,11 +490,11 @@ impl Intersect2<LineSegment2> for LineSegment2 {
         // Self spans [0, 1].
         let lo_s = 0.0_f64.max(lo_r);
         let hi_s = 1.0_f64.min(hi_r);
-        if lo_s > hi_s + tolerance.absolute {
+        if lo_s > hi_s + tol.absolute() {
             return Intersection2::Empty;
         }
         // If overlap is a single point, treat as Point (degenerate segment).
-        if (hi_s - lo_s).abs() <= tolerance.absolute {
+        if (hi_s - lo_s).abs() <= tol.absolute() {
             let t = lo_s.clamp(0.0, 1.0);
             return Intersection2::Point(Point2::new_unchecked(
                 self.start.x + d1.x * t,
@@ -435,7 +502,7 @@ impl Intersect2<LineSegment2> for LineSegment2 {
             ));
         }
         // Full overlap of one covering the other → Coincident.
-        if lo_s <= tolerance.absolute && hi_s >= 1.0 - tolerance.absolute {
+        if lo_s <= tol.absolute() && hi_s >= 1.0 - tol.absolute() {
             return Intersection2::Coincident;
         }
         // Partial overlap → Segment. Route through `new` to preserve the
@@ -452,9 +519,9 @@ impl Intersect2<LineSegment2> for LineSegment2 {
 }
 
 impl Intersect2<crate::circle::Circle2> for LineSegment2 {
-    fn intersect(&self, rhs: &crate::circle::Circle2, tolerance: Tolerance) -> Intersection2 {
+    fn intersect(&self, rhs: &crate::circle::Circle2) -> Intersection2 {
         // Delegate to Circle2.intersect(segment) for symmetric semantics.
-        rhs.intersect(self, tolerance)
+        rhs.intersect(self)
     }
 }
 
@@ -469,7 +536,8 @@ mod tests {
     // Evidence: WO-002-AC01 — Line2 / LineSegment2 serde round-trip.
     // Evidence: WO-002-AC02 — line-line / segment-segment intersection determinism.
     // Evidence: WO-002-AC03 — zero-length segment rejected; coincident points
-    // for line; collinear segments handled.
+    // for line; collinear segments handled; NaN/Inf rejected at the
+    // deserialization canonical-model boundary.
     // Evidence: WO-002-AC04 — projection lies on primitive.
     use super::*;
     use crate::circle::Circle2;
@@ -542,7 +610,7 @@ mod tests {
         let p = s.project_point(&Point2::new(5.0, 5.0).unwrap());
         assert!(approx(p.x, 5.0));
         // Evidence: WO-002-AC04 — projection lies on primitive.
-        assert!(s.contains(&p, Tolerance::DEFAULT));
+        assert!(s.contains(&p));
     }
 
     #[test]
@@ -558,7 +626,7 @@ mod tests {
             Point2::new(0.0, 1.0).unwrap(),
         )
         .unwrap();
-        match l1.intersect(&l2, Tolerance::DEFAULT) {
+        match l1.intersect(&l2) {
             Intersection2::Point(p) => {
                 assert!(approx(p.x, 0.0));
                 assert!(approx(p.y, 0.0));
@@ -579,7 +647,7 @@ mod tests {
             Point2::new(1.0, 1.0).unwrap(),
         )
         .unwrap();
-        assert_eq!(l1.intersect(&l2, Tolerance::DEFAULT), Intersection2::Empty);
+        assert_eq!(l1.intersect(&l2), Intersection2::Empty);
     }
 
     #[test]
@@ -594,10 +662,7 @@ mod tests {
             Point2::new(3.0, 0.0).unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            l1.intersect(&l2, Tolerance::DEFAULT),
-            Intersection2::Coincident
-        );
+        assert_eq!(l1.intersect(&l2), Intersection2::Coincident);
     }
 
     #[test]
@@ -613,7 +678,7 @@ mod tests {
             Point2::new(0.0, 1.0).unwrap(),
         )
         .unwrap();
-        match s1.intersect(&s2, Tolerance::DEFAULT) {
+        match s1.intersect(&s2) {
             Intersection2::Point(p) => {
                 assert!(approx(p.x, 0.0));
                 assert!(approx(p.y, 0.0));
@@ -635,7 +700,7 @@ mod tests {
             Point2::new(6.0, 0.0).unwrap(),
         )
         .unwrap();
-        match s1.intersect(&s2, Tolerance::DEFAULT) {
+        match s1.intersect(&s2) {
             Intersection2::Segment(seg) => {
                 assert!(approx(seg.start.x, 2.0));
                 assert!(approx(seg.end.x, 4.0));
@@ -656,7 +721,7 @@ mod tests {
             Point2::new(6.0, 5.0).unwrap(),
         )
         .unwrap();
-        assert_eq!(s1.intersect(&s2, Tolerance::DEFAULT), Intersection2::Empty);
+        assert_eq!(s1.intersect(&s2), Intersection2::Empty);
         // The minimum distance between two non-overlapping, parallel
         // horizontal segments at y=0 ([0,1]) and y=5 ([5,6]) is the
         // diagonal of a 4-by-5 right triangle (4 = 5-1 horizontal gap,
@@ -677,10 +742,7 @@ mod tests {
             Point2::new(2.0, 0.0).unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            s1.intersect(&s2, Tolerance::DEFAULT),
-            Intersection2::Coincident
-        );
+        assert_eq!(s1.intersect(&s2), Intersection2::Coincident);
     }
 
     #[test]
@@ -695,17 +757,14 @@ mod tests {
             Point2::new(2.0, 2.0).unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            line.intersect(&seg, Tolerance::DEFAULT),
-            Intersection2::Coincident
-        );
+        assert_eq!(line.intersect(&seg), Intersection2::Coincident);
 
         let seg2 = LineSegment2::new(
             Point2::new(-1.0, 3.0).unwrap(),
             Point2::new(3.0, -1.0).unwrap(),
         )
         .unwrap();
-        match line.intersect(&seg2, Tolerance::DEFAULT) {
+        match line.intersect(&seg2) {
             Intersection2::Point(p) => {
                 assert!(approx(p.x, 1.0));
                 assert!(approx(p.y, 1.0));
@@ -723,7 +782,7 @@ mod tests {
             Point2::new(2.0, 0.0).unwrap(),
         )
         .unwrap();
-        match s.intersect(&c, Tolerance::DEFAULT) {
+        match s.intersect(&c) {
             Intersection2::Points(pts) => {
                 assert_eq!(pts.len(), 2);
                 let xs: Vec<f64> = pts.iter().map(|p| p.x).collect();
@@ -743,7 +802,7 @@ mod tests {
         )
         .unwrap();
         let id = Transform2D::identity();
-        let t = s.transform(&id, Tolerance::DEFAULT).unwrap();
+        let t = s.transform(&id).unwrap();
         assert!(approx(t.start.x, s.start.x));
         assert!(approx(t.start.y, s.start.y));
         assert!(approx(t.end.x, s.end.x));
@@ -792,8 +851,9 @@ mod tests {
 
     #[test]
     fn validate_rejects_deserialized_zero_length() {
-        // After deserialization, validate() must catch a zero-length segment
-        // that snuck in.
+        // After direct struct-literal construction (test-only path; not a
+        // canonical-model boundary), `validate()` must catch a zero-length
+        // segment that snuck in.
         let bad = LineSegment2 {
             start: Point2::ORIGIN,
             end: Point2::ORIGIN,

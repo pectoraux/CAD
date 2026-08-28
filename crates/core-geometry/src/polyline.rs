@@ -9,18 +9,35 @@ use crate::ops::{
 use crate::point::Point2;
 use crate::tolerance::Tolerance;
 use crate::transform::Transform2D;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Serialize,
+    de::{self, Deserializer},
+};
 
 /// A 2D polyline: a sequence of vertices connected by line segments. May be
 /// open or closed (closed polylines connect the last vertex back to the
 /// first).
 ///
-/// Construction invariants:
+/// ## Construction invariants
 /// - All vertices finite.
-/// - Open polylines need at least 2 distinct vertices.
-/// - Closed polylines need at least 3 distinct vertices (a closed 2-vertex
-///   polyline would be a degenerate segment traced both ways).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// - Open polylines need at least 2 vertices; closed polylines need at
+///   least 3.
+/// - **Adjacent duplicate vertices are ACCEPTED**: a polyline may have
+///   `vertices[i] == vertices[i+1]`. Such a segment is degenerate
+///   (zero-length) and is skipped by [`Self::segment`], which returns
+///   `None` for it. This is consistent with [`LineSegment2::new`], which
+///   rejects zero-length segments; `Polyline2::segment` never bypasses
+///   that invariant. Direct duplicate-vertex filtering at construction is
+///   NOT performed — callers that need a deduplicated polyline should
+///   filter the input before calling [`Self::new`].
+///
+/// ## Wire (deserialization) boundary
+/// Deserialization delegates to a private `RawPolyline2` shadow and then
+/// calls [`Self::validate`], so non-finite vertices and insufficient
+/// vertex counts are rejected at the deserialization canonical-model
+/// boundary (per `spec/domain-model.md` §"Core value types and
+/// invariants").
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Polyline2 {
     /// Vertex list (in order; non-empty after construction).
     pub vertices: Vec<Point2>,
@@ -28,11 +45,38 @@ pub struct Polyline2 {
     pub closed: bool,
 }
 
+/// Private shadow struct used as the serde wire shape for [`Polyline2`].
+#[derive(Deserialize)]
+struct RawPolyline2 {
+    vertices: Vec<Point2>,
+    closed: bool,
+}
+
+impl TryFrom<RawPolyline2> for Polyline2 {
+    type Error = GeometryError;
+
+    fn try_from(r: RawPolyline2) -> Result<Self, Self::Error> {
+        Self::new(r.vertices, r.closed)
+    }
+}
+
+impl<'de> Deserialize<'de> for Polyline2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawPolyline2::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(de::Error::custom)
+    }
+}
+
 impl Polyline2 {
     /// Construct a polyline from vertices and a `closed` flag.
     ///
     /// Validates that all vertices are finite and that the vertex-count
-    /// requirement is met (open: ≥ 2; closed: ≥ 3 distinct vertices).
+    /// requirement is met (open: ≥ 2; closed: ≥ 3). Adjacent duplicate
+    /// vertices are accepted (the corresponding segment is degenerate
+    /// and skipped by [`Self::segment`], which returns `None` for it).
     #[must_use]
     pub fn new(vertices: Vec<Point2>, closed: bool) -> Result<Self, GeometryError> {
         for v in &vertices {
@@ -88,7 +132,7 @@ impl Polyline2 {
     }
 
     /// Total length: sum of segment lengths. Closed polylines include the
-    /// closing segment.
+    /// closing segment. Degenerate (zero-length) segments contribute 0.
     #[must_use]
     pub fn length(&self) -> f64 {
         let mut sum = 0.0;
@@ -100,7 +144,8 @@ impl Polyline2 {
         sum
     }
 
-    /// Closest point on the polyline to `p`.
+    /// Closest point on the polyline to `p`. EXACT (per-segment exact
+    /// orthogonal projection; degenerate segments are skipped).
     #[must_use]
     pub fn project_point(&self, p: &Point2) -> Point2 {
         let mut best = f64::INFINITY;
@@ -118,19 +163,21 @@ impl Polyline2 {
         best_pt
     }
 
-    /// Distance from `p` to the polyline curve.
+    /// Distance from `p` to the polyline curve. EXACT (delegates to
+    /// [`Self::project_point`]).
     #[must_use]
     pub fn distance_to_point(&self, p: &Point2) -> f64 {
         self.project_point(p).distance_to(*p)
     }
 
     /// Returns `true` if `p` lies on the polyline curve (boundary) within
-    /// `tolerance`.
+    /// the canonical tolerance policy
+    /// ([`Tolerance::CANONICAL`](crate::tolerance::Tolerance::CANONICAL)).
     #[must_use]
-    pub fn contains_point(&self, p: &Point2, tolerance: Tolerance) -> bool {
+    pub fn contains_point(&self, p: &Point2) -> bool {
         for i in 0..self.segment_count() {
             if let Some(s) = self.segment(i)
-                && s.contains_point(p, tolerance)
+                && s.contains_point(p)
             {
                 return true;
             }
@@ -164,7 +211,7 @@ impl Bounded2 for Polyline2 {
 }
 
 impl Transformable2 for Polyline2 {
-    fn transform(&self, transform: &Transform2D, _tol: Tolerance) -> Result<Self, GeometryError> {
+    fn transform(&self, transform: &Transform2D) -> Result<Self, GeometryError> {
         let vertices = self
             .vertices
             .iter()
@@ -187,20 +234,21 @@ impl DistanceTo2<Point2> for Polyline2 {
 }
 
 impl Project2 for Polyline2 {
-    fn project_point(&self, point: &Point2, _tol: Tolerance) -> Point2 {
+    fn project_point(&self, point: &Point2) -> Point2 {
         self.project_point(point)
     }
 }
 
 impl Contains2<Point2> for Polyline2 {
-    fn contains(&self, rhs: &Point2, tol: Tolerance) -> bool {
-        self.contains_point(rhs, tol)
+    fn contains(&self, rhs: &Point2) -> bool {
+        self.contains_point(rhs)
     }
 }
 
 impl Intersect2<LineSegment2> for Polyline2 {
-    fn intersect(&self, rhs: &LineSegment2, tolerance: Tolerance) -> Intersection2 {
+    fn intersect(&self, rhs: &LineSegment2) -> Intersection2 {
         // Intersect each polyline segment with `rhs` and deduplicate results.
+        let tolerance = Tolerance::CANONICAL;
         let mut points: Vec<Point2> = Vec::new();
         let mut segment_hits: Vec<LineSegment2> = Vec::new();
         for i in 0..self.segment_count() {
@@ -208,12 +256,12 @@ impl Intersect2<LineSegment2> for Polyline2 {
             if s.start.x == s.end.x && s.start.y == s.end.y {
                 continue;
             }
-            match s.intersect(rhs, tolerance) {
+            match s.intersect(rhs) {
                 Intersection2::Empty => {}
                 Intersection2::Point(p) => {
                     if !points
                         .iter()
-                        .any(|q| q.distance_to(&p) <= tolerance.absolute)
+                        .any(|q| q.distance_to(&p) <= tolerance.absolute())
                     {
                         points.push(p);
                     }
@@ -222,7 +270,7 @@ impl Intersect2<LineSegment2> for Polyline2 {
                     for p in ps {
                         if !points
                             .iter()
-                            .any(|q| q.distance_to(&p) <= tolerance.absolute)
+                            .any(|q| q.distance_to(&p) <= tolerance.absolute())
                         {
                             points.push(p);
                         }
@@ -275,7 +323,8 @@ pub fn point_in_polygon(p: &Point2, polygon: &Polyline2) -> bool {
 mod tests {
     // Evidence: WO-002-AC01 — Polyline2 serde round-trip.
     // Evidence: WO-002-AC03 — insufficient vertices rejected; degenerate
-    // adjacent vertices handled gracefully.
+    // adjacent vertices handled gracefully (segment returns None); NaN/Inf
+    // rejected at the deserialization canonical-model boundary.
     // Evidence: WO-002-AC04 — bbox contains vertices; transform identity
     // invariance; projection on polyline.
     use super::*;
@@ -311,6 +360,22 @@ mod tests {
             Point2::new(1.0, 0.0).unwrap(),
         ];
         assert!(Polyline2::new(pts, false).is_err());
+    }
+
+    #[test]
+    fn new_accepts_adjacent_duplicate_vertices() {
+        // Evidence: WO-002-AC03 — adjacent duplicate vertices are ACCEPTED
+        // at construction (the corresponding segment is degenerate and is
+        // skipped by `segment()`, which returns `None` for it). The docs
+        // now match the behavior (the prior docs claimed "distinct
+        // vertices", which was inconsistent with the impl).
+        let pts = vec![
+            Point2::new(0.0, 0.0).unwrap(),
+            Point2::new(1.0, 1.0).unwrap(),
+            Point2::new(1.0, 1.0).unwrap(), // duplicate of previous
+            Point2::new(2.0, 2.0).unwrap(),
+        ];
+        assert!(Polyline2::new(pts, false).is_ok());
     }
 
     #[test]
@@ -354,7 +419,7 @@ mod tests {
         let q = p.project_point(&Point2::new(1.0, 0.5).unwrap());
         assert!(approx(q.x, 1.0));
         assert!(approx(q.y, 0.0));
-        assert!(p.contains(&q, Tolerance::DEFAULT));
+        assert!(p.contains(&q));
     }
 
     #[test]
@@ -390,7 +455,7 @@ mod tests {
             Point2::new(0.5, 2.0).unwrap(),
         )
         .unwrap();
-        match sq.intersect(&seg, Tolerance::DEFAULT) {
+        match sq.intersect(&seg) {
             Intersection2::Points(ps) => assert_eq!(ps.len(), 2),
             other => panic!("expected 2 crossings, got {other:?}"),
         }
@@ -405,9 +470,7 @@ mod tests {
             Point2::new(3.0, 4.0).unwrap(),
         ];
         let p = Polyline2::new(pts, false).unwrap();
-        let q = p
-            .transform(&Transform2D::identity(), Tolerance::DEFAULT)
-            .unwrap();
+        let q = p.transform(&Transform2D::identity()).unwrap();
         for (a, b) in p.vertices.iter().zip(q.vertices.iter()) {
             assert!(approx(a.x, b.x));
             assert!(approx(a.y, b.y));
@@ -456,6 +519,9 @@ mod tests {
 
     #[test]
     fn validate_rejects_deserialized_empty() {
+        // Direct struct-literal construction (test-only path; not a
+        // canonical-model boundary) can still produce an empty polyline;
+        // `validate()` is the explicit check for such values.
         let bad = Polyline2 {
             vertices: vec![],
             closed: false,

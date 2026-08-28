@@ -5,17 +5,45 @@ use crate::ops::{Bounded2, Contains2, Transformable2, Validate};
 use crate::point::Point2;
 use crate::tolerance::Tolerance;
 use crate::transform::Transform2D;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Serialize,
+    de::{self, Deserializer},
+};
 
 /// An axis-aligned bounding box with `min` and `max` corners. Invariants:
 /// `min.x <= max.x` and `min.y <= max.y`. A zero-area box (a single point)
 /// is permitted and considered degenerate (see [`Self::is_degenerate`]).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct BoundingBox2 {
     /// The lower corner (smallest x and y).
     pub min: Point2,
     /// The upper corner (largest x and y).
     pub max: Point2,
+}
+
+/// Private shadow struct used as the serde wire shape for [`BoundingBox2`].
+#[derive(Deserialize)]
+struct RawBoundingBox2 {
+    min: Point2,
+    max: Point2,
+}
+
+impl TryFrom<RawBoundingBox2> for BoundingBox2 {
+    type Error = GeometryError;
+
+    fn try_from(r: RawBoundingBox2) -> Result<Self, Self::Error> {
+        Self::new(r.min, r.max)
+    }
+}
+
+impl<'de> Deserialize<'de> for BoundingBox2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawBoundingBox2::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(de::Error::custom)
+    }
 }
 
 impl BoundingBox2 {
@@ -94,6 +122,7 @@ impl BoundingBox2 {
     }
 
     /// Returns `true` if `point` lies inside or on the boundary of `self`.
+    /// EXACT (no tolerance needed for an AABB point-in-box test).
     #[must_use]
     pub fn contains(&self, point: &Point2) -> bool {
         point.x >= self.min.x
@@ -140,10 +169,12 @@ impl BoundingBox2 {
     }
 
     /// Returns `true` if the box has zero area (a single point or a line)
-    /// within `tolerance`.
+    /// within the canonical tolerance policy
+    /// ([`Tolerance::CANONICAL`](crate::tolerance::Tolerance::CANONICAL)).
     #[must_use]
-    pub fn is_degenerate(&self, tolerance: Tolerance) -> bool {
-        self.width() <= tolerance.absolute && self.height() <= tolerance.absolute
+    pub fn is_degenerate(&self) -> bool {
+        self.width() <= Tolerance::CANONICAL.absolute()
+            && self.height() <= Tolerance::CANONICAL.absolute()
     }
 
     /// Returns the four corner points of the box, CCW starting from `min`.
@@ -182,7 +213,7 @@ impl Transformable2 for BoundingBox2 {
     /// then re-fit an axis-aligned box. The resulting AABB is conservative
     /// (it may be larger than the rotated box; never smaller). Always
     /// representable — returns `Ok`.
-    fn transform(&self, transform: &Transform2D, _tol: Tolerance) -> Result<Self, GeometryError> {
+    fn transform(&self, transform: &Transform2D) -> Result<Self, GeometryError> {
         let mut min_x = f64::INFINITY;
         let mut min_y = f64::INFINITY;
         let mut max_x = f64::NEG_INFINITY;
@@ -210,16 +241,16 @@ impl Transformable2 for BoundingBox2 {
 }
 
 impl Contains2<Point2> for BoundingBox2 {
-    /// Containment is exact (no tolerance needed for an AABB point-in-box
-    /// test); the `tol` parameter is accepted for trait-signature
-    /// consistency and ignored.
-    fn contains(&self, rhs: &Point2, _tol: Tolerance) -> bool {
+    /// Containment is EXACT (no tolerance needed for an AABB point-in-box
+    /// test); the canonical tolerance policy is not consulted (the test
+    /// is structurally exact).
+    fn contains(&self, rhs: &Point2) -> bool {
         BoundingBox2::contains(self, rhs)
     }
 }
 
 impl Contains2<BoundingBox2> for BoundingBox2 {
-    fn contains(&self, rhs: &BoundingBox2, _tol: Tolerance) -> bool {
+    fn contains(&self, rhs: &BoundingBox2) -> bool {
         BoundingBox2::contains_box(self, rhs)
     }
 }
@@ -227,13 +258,13 @@ impl Contains2<BoundingBox2> for BoundingBox2 {
 #[cfg(test)]
 mod tests {
     // Evidence: WO-002-AC01 — BoundingBox2 serde round-trip.
-    // Evidence: WO-002-AC03 — empty point list, min > max rejected.
+    // Evidence: WO-002-AC03 — empty point list, min > max rejected; NaN/Inf
+    // rejected at the deserialization canonical-model boundary.
     // Evidence: WO-002-AC04 — bbox contains its points; transform-then-bbox
     // consistency for translation.
     use super::*;
     use crate::ops::{Bounded2, Transformable2, Validate};
     use crate::testutil::{Prng, roundtrip};
-    use crate::tolerance::Tolerance;
 
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
@@ -316,13 +347,13 @@ mod tests {
     fn is_degenerate_for_point() {
         let p = Point2::new(1.0, 2.0).unwrap();
         let b = p.bounding_box();
-        assert!(b.is_degenerate(Tolerance::DEFAULT));
+        assert!(b.is_degenerate());
         let real = BoundingBox2::new(
             Point2::new(0.0, 0.0).unwrap(),
             Point2::new(1.0, 1.0).unwrap(),
         )
         .unwrap();
-        assert!(!real.is_degenerate(Tolerance::DEFAULT));
+        assert!(!real.is_degenerate());
     }
 
     #[test]
@@ -336,9 +367,9 @@ mod tests {
         ];
         let b1 = BoundingBox2::from_points(&pts).unwrap();
         let t = Transform2D::translation(7.0, -4.0);
-        let transformed_pts = pts.map(|p| p.transform(&t, Tolerance::DEFAULT).unwrap());
+        let transformed_pts = pts.map(|p| p.transform(&t).unwrap());
         let b2 = BoundingBox2::from_points(&transformed_pts).unwrap();
-        let b3 = b1.transform(&t, Tolerance::DEFAULT).unwrap();
+        let b3 = b1.transform(&t).unwrap();
         assert!(approx(b2.min.x, b3.min.x));
         assert!(approx(b2.min.y, b3.min.y));
         assert!(approx(b2.max.x, b3.max.x));

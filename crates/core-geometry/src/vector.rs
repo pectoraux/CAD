@@ -11,18 +11,61 @@
 use crate::error::GeometryError;
 use crate::ops::Validate;
 use crate::tolerance::Tolerance;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Serialize,
+    de::{self, Deserializer},
+};
 
 /// A 2D vector with `f64` components. NaN/Inf are rejected at construction.
 ///
 /// `Vector2` is `Copy`; passing it by value is cheap and allocation-free on
 /// the hot path (per architecture §6).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Vector2 {
     /// X component.
     pub x: f64,
     /// Y component.
     pub y: f64,
+}
+
+// ---------------------------------------------------------------------------
+// Canonical-model boundary: Deserialize delegates to a private Raw shadow
+// and then calls `Validate`, so non-finite values are rejected at the
+// deserialization boundary (per spec/domain-model.md §"Core value types
+// and invariants": "f64 values must be finite. NaN and infinities are
+// rejected at every canonical-model boundary."). Direct struct-literal
+// construction remains possible (e.g. for tests of `validate()`); the
+// canonical boundaries are `Vector2::new()` and `Deserialize`.
+// ---------------------------------------------------------------------------
+
+/// Private shadow struct used as the serde wire shape for [`Vector2`].
+/// Carries the raw (unvalidated) field values from the deserializer; the
+/// `TryFrom` impl on `Vector2` then enforces the canonical-model
+/// finiteness invariant.
+#[derive(Deserialize)]
+struct RawVector2 {
+    x: f64,
+    y: f64,
+}
+
+impl TryFrom<RawVector2> for Vector2 {
+    type Error = GeometryError;
+
+    fn try_from(r: RawVector2) -> Result<Self, Self::Error> {
+        let v = Self { x: r.x, y: r.y };
+        v.validate()?;
+        Ok(v)
+    }
+}
+
+impl<'de> Deserialize<'de> for Vector2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawVector2::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(de::Error::custom)
+    }
 }
 
 impl Vector2 {
@@ -91,21 +134,26 @@ impl Vector2 {
         }
     }
 
-    /// Returns `true` if this vector's length is within `tolerance.absolute`
-    /// of zero.
+    /// Returns `true` if this vector's length is within the canonical
+    /// tolerance policy
+    /// ([`Tolerance::CANONICAL`](crate::tolerance::Tolerance::CANONICAL))
+    /// of zero. Per the frozen v1.1 contract, the tolerance is not
+    /// caller-chosen per-operation.
     #[must_use]
-    pub fn is_zero(self, tolerance: Tolerance) -> bool {
-        self.length_squared() <= tolerance.coincident_squared()
+    pub fn is_zero(self) -> bool {
+        self.length_squared() <= Tolerance::CANONICAL.coincident_squared()
     }
 
     /// Returns the unit vector in the direction of `self`, or `None` if
-    /// `self` is near-zero length within the supplied `tolerance` policy.
+    /// `self` is near-zero length within the canonical tolerance policy
+    /// ([`Tolerance::CANONICAL`](crate::tolerance::Tolerance::CANONICAL)).
     ///
-    /// Per the frozen v1.1 contract, tolerance is never implicit; callers
-    /// must supply the policy appropriate to their scope.
+    /// Per the frozen v1.1 contract, tolerance is never implicit or
+    /// caller-chosen on a per-operation basis; the canonical policy is
+    /// used internally.
     #[must_use]
-    pub fn normalize_with(self, tolerance: Tolerance) -> Option<Self> {
-        if self.is_zero(tolerance) {
+    pub fn normalize(self) -> Option<Self> {
+        if self.is_zero() {
             return None;
         }
         let len = self.length();
@@ -185,7 +233,8 @@ impl Validate for Vector2 {
 #[cfg(test)]
 mod tests {
     // Evidence: WO-002-AC01 — Vector2 round-trip serialization.
-    // Evidence: WO-002-AC03 — NaN/Inf rejection at construction.
+    // Evidence: WO-002-AC03 — NaN/Inf rejection at construction AND at the
+    // deserialization canonical-model boundary (try_from + validate).
     use super::*;
     use crate::ops::Validate;
 
@@ -202,7 +251,9 @@ mod tests {
 
     #[test]
     fn validate_rejects_serde_deserialized_nan() {
-        // Deserialized vectors MUST be validate()d at canonical boundaries.
+        // Direct struct-literal construction (test-only path; not a
+        // canonical-model boundary) can still produce a non-finite value,
+        // and `validate()` is the explicit check for such values.
         let v = Vector2 {
             x: f64::NAN,
             y: 1.0,
@@ -224,11 +275,8 @@ mod tests {
 
     #[test]
     fn normalize_zero_handling() {
-        assert!(Vector2::ZERO.normalize_with(Tolerance::DEFAULT).is_none());
-        let n = Vector2::new(3.0, 4.0)
-            .unwrap()
-            .normalize_with(Tolerance::DEFAULT)
-            .unwrap();
+        assert!(Vector2::ZERO.normalize().is_none());
+        let n = Vector2::new(3.0, 4.0).unwrap().normalize().unwrap();
         assert!(approx(n.length(), 1.0));
     }
 

@@ -9,15 +9,27 @@
 //! Frozen-contract invariants honored here:
 //! - All coordinates use IEEE-754 `f64` at the API boundary.
 //! - `f64` values must be finite; NaN and infinities are rejected at every
-//!   canonical-model boundary (via [`Validate`](ops::Validate) and the
-//!   `new()` constructors).
-//! - Predicates that require robust classification use an explicit
-//!   [`Tolerance`]; tolerance is never implicit or caller-chosen on a
-//!   per-operation basis.
+//!   canonical-model boundary. Each geometry type's `Deserialize` impl
+//!   delegates to a private `RawXxx` shadow and then calls
+//!   [`Validate`](ops::Validate), so deserialization is a canonical-model
+//!   boundary that automatically rejects non-finite / degenerate values
+//!   (per `spec/domain-model.md` §"Core value types and invariants").
+//! - Predicates that require robust classification use the explicit,
+//!   singleton canonical tolerance policy
+//!   [`Tolerance::CANONICAL`](tolerance::Tolerance::CANONICAL); tolerance
+//!   is never implicit or caller-chosen on a per-operation basis. There
+//!   is NO per-call `tol: Tolerance` parameter on any predicate-style
+//!   method signature in this crate.
 //! - `Transform2D` uses the EXACT field names `translation`, `rotation_rad`,
 //!   `scale_x`, `scale_y` per `spec/domain-model.md`.
 //! - Geometry primitives are `Copy` stack value types (no heap allocations
 //!   on the hot path, per architecture §6).
+//! - Exact vs approximate operations are separated: [`Project2`](ops::Project2)
+//!   and [`DistanceTo2`](ops::DistanceTo2) are EXACT; primitives whose
+//!   closest-point / distance cannot be computed exactly in closed form
+//!   (e.g. `Ellipse2`, `Spline2`) implement
+//!   [`ApproximateProject2`](ops::ApproximateProject2) /
+//!   [`ApproximateDistanceTo2`](ops::ApproximateDistanceTo2) instead.
 //! - Reproducibility: no wall-clock, no `HashMap` iteration, no uncontrolled
 //!   randomness; the property-test PRNG uses a fixed seed
 //!   (see [`testutil::Prng`]).
@@ -87,7 +99,8 @@ pub use ellipse::Ellipse2;
 pub use error::GeometryError;
 pub use line::{Line2, LineSegment2};
 pub use ops::{
-    Bounded2, Contains2, DistanceTo2, Intersect2, Intersection2, Project2, Transformable2, Validate,
+    ApproximateDistanceTo2, ApproximateProject2, Bounded2, Contains2, DistanceTo2, Intersect2,
+    Intersection2, Project2, Transformable2, Validate,
 };
 pub use point::Point2;
 pub use polyline::{Polyline2, point_in_polygon};
@@ -237,9 +250,7 @@ mod tests {
         let mut prng = Prng::new();
         for _ in 0..256 {
             let p = Point2::new(prng.signed_f64(1000.0), prng.signed_f64(1000.0)).unwrap();
-            let q = p
-                .transform(&id, crate::tolerance::Tolerance::DEFAULT)
-                .unwrap();
+            let q = p.transform(&id).unwrap();
             assert!((q.x - p.x).abs() < 1e-9);
             assert!((q.y - p.y).abs() < 1e-9);
         }

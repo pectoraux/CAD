@@ -1,16 +1,32 @@
 //! 2D ellipses (axis-aligned in local frame, with optional rotation).
+//!
+//! Per the frozen v1.1 contract, this module distinguishes EXACT from
+//! APPROXIMATE operations on `Ellipse2`:
+//! - **EXACT**: bounding box (analytical AABB), contains (implicit value),
+//!   transform (exact affine image via eigendecomposition), intersect with
+//!   line / segment (analytical quadratic).
+//! - **APPROXIMATE**: closest-point projection (Newton iteration + grid
+//!   fallback), distance (delegates to approximate projection). These are
+//!   deliberately exposed via the [`ApproximateProject2`] /
+//!   [`ApproximateDistanceTo2`] traits and `_approx` inherent method names
+//!   so callers cannot silently use an approximate result where an exact
+//!   result is required.
 
 use crate::bbox::BoundingBox2;
 use crate::error::GeometryError;
 use crate::line::{Line2, LineSegment2};
 use crate::ops::{
-    Bounded2, Contains2, DistanceTo2, Intersect2, Intersection2, Project2, Transformable2, Validate,
+    ApproximateDistanceTo2, ApproximateProject2, Bounded2, Contains2, Intersect2, Intersection2,
+    Transformable2, Validate,
 };
 use crate::point::Point2;
 use crate::tolerance::Tolerance;
 use crate::transform::Transform2D;
 use crate::vector::Vector2;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Serialize,
+    de::{self, Deserializer},
+};
 
 /// A 2D ellipse centered at `center` with semi-axes `radii = (rx, ry)` and
 /// counter-clockwise rotation `rotation_rad` of its local frame.
@@ -18,7 +34,7 @@ use serde::{Deserialize, Serialize};
 /// Both `radii.x` and `radii.y` must be strictly positive and finite. The
 /// curve is the locus `(x'/rx)^2 + (y'/ry)^2 = 1` where `(x', y')` is the
 /// point in the local (rotated+translated) frame.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Ellipse2 {
     /// Center of the ellipse.
     pub center: Point2,
@@ -26,6 +42,32 @@ pub struct Ellipse2 {
     pub radii: Vector2,
     /// Counter-clockwise rotation of the local frame in radians.
     pub rotation_rad: f64,
+}
+
+/// Private shadow struct used as the serde wire shape for [`Ellipse2`].
+#[derive(Deserialize)]
+struct RawEllipse2 {
+    center: Point2,
+    radii: Vector2,
+    rotation_rad: f64,
+}
+
+impl TryFrom<RawEllipse2> for Ellipse2 {
+    type Error = GeometryError;
+
+    fn try_from(r: RawEllipse2) -> Result<Self, Self::Error> {
+        Self::new(r.center, r.radii, r.rotation_rad)
+    }
+}
+
+impl<'de> Deserialize<'de> for Ellipse2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawEllipse2::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(de::Error::custom)
+    }
 }
 
 impl Ellipse2 {
@@ -67,7 +109,8 @@ impl Ellipse2 {
     }
 
     /// Returns the normalized radial coordinate `(x'/rx)^2 + (y'/ry)^2 - 1`.
-    /// Zero on the curve; negative inside; positive outside.
+    /// Zero on the curve; negative inside; positive outside. EXACT (no
+    /// sampling, no iteration).
     #[must_use]
     pub fn implicit_value(&self, point: &Point2) -> f64 {
         let v = self.to_local(point);
@@ -75,41 +118,50 @@ impl Ellipse2 {
             - 1.0
     }
 
-    /// Closest point on the ellipse curve to `p`.
+    /// APPROXIMATE closest point on the ellipse curve to `p`.
     ///
     /// Uses Newton iteration on the parametric form `P(t) = (rx cos t, ry sin t)`
     /// in local coordinates, after rotating back. Converges in a few
     /// iterations for well-conditioned inputs; falls back to a coarse grid
-    /// scan if iteration fails to converge. Documented as approximate; exact
+    /// scan if iteration fails to converge. The center-coincidence check in
+    /// `initial_guess_angle` is exact-zero (no implicit tolerance per the
+    /// frozen v1.1 contract).
+    ///
+    /// This operation is APPROXIMATE; it is exposed via the
+    /// [`ApproximateProject2`] trait and the `_approx` inherent method
+    /// name to keep it separated from exact geometry semantics. Exact
     /// closest-point on a rotated ellipse is quartic and is deferred to a
-    /// later refinement per W002 scope ("a foundation; sampling-based with
-    /// deterministic sample count is acceptable"). The center-coincidence
-    /// check in `initial_guess_angle` is exact-zero (no implicit tolerance
-    /// per the frozen v1.1 contract).
+    /// later refinement per W002 scope ("a foundation; sampling-based
+    /// with deterministic sample count is acceptable").
     #[must_use]
-    pub fn project_point(&self, p: &Point2) -> Point2 {
+    pub fn project_point_approx(&self, p: &Point2) -> Point2 {
         let local = self.to_local(p);
         let t0 = Self::initial_guess_angle(&local);
         let t = self.refine_angle(t0, &local);
         self.point_at_angle(t)
     }
 
-    /// Distance from `p` to the ellipse curve.
+    /// APPROXIMATE distance from `p` to the ellipse curve. Delegates to
+    /// [`Self::project_point_approx`]; the result may differ from the true
+    /// distance by a small epsilon.
     #[must_use]
-    pub fn distance_to_point(&self, p: &Point2) -> f64 {
-        self.project_point(p).distance_to(*p)
+    pub fn distance_to_point_approx(&self, p: &Point2) -> f64 {
+        self.project_point_approx(p).distance_to(*p)
     }
 
-    /// Returns `true` if `p` lies on the ellipse curve within `tolerance`
-    /// (uses the implicit value scaled by the larger semi-axis).
+    /// Returns `true` if `p` lies on the ellipse curve within the canonical
+    /// tolerance policy
+    /// ([`Tolerance::CANONICAL`](crate::tolerance::Tolerance::CANONICAL)).
+    /// Uses the exact implicit value scaled by the larger semi-axis; this
+    /// is an EXACT on-curve classification, not an approximation.
     #[must_use]
-    pub fn contains_point(&self, p: &Point2, tolerance: Tolerance) -> bool {
+    pub fn contains_point(&self, p: &Point2) -> bool {
         let scale = self.radii.x.max(self.radii.y);
-        self.implicit_value(p).abs() * scale <= tolerance.absolute
+        self.implicit_value(p).abs() * scale <= Tolerance::CANONICAL.absolute()
     }
 
     /// Returns `true` if `p` lies inside the closed region bounded by the
-    /// ellipse.
+    /// ellipse. EXACT (uses the implicit value).
     #[must_use]
     pub fn contains_disk(&self, p: &Point2) -> bool {
         self.implicit_value(p) <= 0.0
@@ -237,11 +289,15 @@ impl Transformable2 for Ellipse2 {
     /// from the unit circle: `M = R(φ)·diag(sx, sy)·R(θ)·diag(a, b)`.
     ///
     /// Returns `Err(GeometryError::Degenerate(_))` when the transform
-    /// collapses the ellipse to a point or line (singular).
+    /// collapses the ellipse to a point or line (singular). The collapse
+    /// detection uses the canonical tolerance policy
+    /// ([`Tolerance::CANONICAL`](crate::tolerance::Tolerance::CANONICAL))
+    /// internally; tolerance is NOT caller-chosen per-operation (frozen
+    /// v1.1 contract).
     ///
     /// Evidence: WO-002-AC02 — exact image, no silent approximation.
     /// Evidence: WO-002-AC03 — singular collapse explicitly rejected.
-    fn transform(&self, transform: &Transform2D, tol: Tolerance) -> Result<Self, GeometryError> {
+    fn transform(&self, transform: &Transform2D) -> Result<Self, GeometryError> {
         let phi = transform.rotation_rad;
         let sx = transform.scale_x;
         let sy = transform.scale_y;
@@ -280,7 +336,8 @@ impl Transformable2 for Ellipse2 {
         let lambda_max = tr / 2.0 + sqrt_disc;
         let lambda_min = tr / 2.0 - sqrt_disc;
 
-        let tol_sq = tol.absolute * tol.absolute;
+        let tol = Tolerance::CANONICAL;
+        let tol_sq = tol.squared();
         if lambda_max <= tol_sq {
             return Err(GeometryError::Degenerate(
                 "transform collapses ellipse to a point",
@@ -298,7 +355,7 @@ impl Transformable2 for Ellipse2 {
         // Eigenvector for lambda_max: for [[s00, s01], [s01, s11]], the
         // eigenvector for the larger eigenvalue is (s01, lambda_max - s00)
         // when s01 != 0; angle = atan2(s01, lambda_max - s11).
-        let new_rotation = if s01.abs() > tol.absolute {
+        let new_rotation = if s01.abs() > tol.absolute() {
             s01.atan2(lambda_max - s11)
         } else if s00 >= s11 {
             0.0
@@ -315,28 +372,36 @@ impl Transformable2 for Ellipse2 {
     }
 }
 
-impl DistanceTo2<Point2> for Ellipse2 {
-    fn distance_to(&self, rhs: &Point2) -> f64 {
-        self.distance_to_point(rhs)
+impl ApproximateDistanceTo2<Point2> for Ellipse2 {
+    /// APPROXIMATE distance from `self` to `rhs`. Delegates to
+    /// [`Ellipse2::project_point_approx`]; the result may differ from the
+    /// true distance by a small epsilon.
+    fn distance_to_approx(&self, rhs: &Point2) -> f64 {
+        self.distance_to_point_approx(rhs)
     }
 }
 
-impl Project2 for Ellipse2 {
-    fn project_point(&self, point: &Point2, _tol: Tolerance) -> Point2 {
-        self.project_point(point)
+impl ApproximateProject2 for Ellipse2 {
+    /// APPROXIMATE closest point. See [`Ellipse2::project_point_approx`]
+    /// for the approximation strategy.
+    fn project_point_approx(&self, point: &Point2) -> Point2 {
+        self.project_point_approx(point)
     }
 }
 
 impl Contains2<Point2> for Ellipse2 {
-    fn contains(&self, rhs: &Point2, tol: Tolerance) -> bool {
-        self.contains_point(rhs, tol)
+    /// EXACT on-curve classification (uses the implicit value scaled by the
+    /// larger semi-axis, compared to the canonical tolerance policy).
+    fn contains(&self, rhs: &Point2) -> bool {
+        self.contains_point(rhs)
     }
 }
 
 impl Intersect2<Line2> for Ellipse2 {
-    fn intersect(&self, rhs: &Line2, tolerance: Tolerance) -> Intersection2 {
+    fn intersect(&self, rhs: &Line2) -> Intersection2 {
         // Transform the line into the ellipse's local frame: rotate the line's
         // direction and point by -rotation_rad about the ellipse center.
+        let tolerance = Tolerance::CANONICAL;
         let c = (-self.rotation_rad).cos();
         let s = (-self.rotation_rad).sin();
         let local_pt = {
@@ -358,10 +423,10 @@ impl Intersect2<Line2> for Ellipse2 {
         let b = 2.0 * (px * dx / (rx * rx) + py * dy / (ry * ry));
         let cc = (px * px) / (rx * rx) + (py * py) / (ry * ry) - 1.0;
         let disc = b * b - 4.0 * a * cc;
-        if disc < -tolerance.absolute {
+        if disc < -tolerance.absolute() {
             return Intersection2::Empty;
         }
-        if disc.abs() <= tolerance.absolute {
+        if disc.abs() <= tolerance.absolute() {
             let t = -b / (2.0 * a);
             let local_hit = Point2::new_unchecked(px + dx * t, py + dy * t);
             return Intersection2::Point(self.local_to_world(&local_hit));
@@ -376,9 +441,10 @@ impl Intersect2<Line2> for Ellipse2 {
 }
 
 impl Intersect2<LineSegment2> for Ellipse2 {
-    fn intersect(&self, rhs: &LineSegment2, tolerance: Tolerance) -> Intersection2 {
+    fn intersect(&self, rhs: &LineSegment2) -> Intersection2 {
         // Sample-and-clip: treat the segment parametrically (start..=end),
         // solve the quadratic in segment parameter t in [0,1].
+        let tolerance = Tolerance::CANONICAL;
         let c = (-self.rotation_rad).cos();
         let s = (-self.rotation_rad).sin();
         let local_start = {
@@ -401,10 +467,10 @@ impl Intersect2<LineSegment2> for Ellipse2 {
         let b = 2.0 * (px * dx / (rx * rx) + py * dy / (ry * ry));
         let cc = (px * px) / (rx * rx) + (py * py) / (ry * ry) - 1.0;
         let disc = b * b - 4.0 * a * cc;
-        if disc < -tolerance.absolute {
+        if disc < -tolerance.absolute() {
             return Intersection2::Empty;
         }
-        if disc.abs() <= tolerance.absolute {
+        if disc.abs() <= tolerance.absolute() {
             let t = -b / (2.0 * a);
             if (0.0..=1.0).contains(&t) {
                 let local_hit = Point2::new_unchecked(px + dx * t, py + dy * t);
@@ -446,8 +512,10 @@ impl Ellipse2 {
 #[cfg(test)]
 mod tests {
     // Evidence: WO-002-AC01 — Ellipse2 serde round-trip.
-    // Evidence: WO-002-AC03 — degenerate axes rejected; NaN/Inf rejected.
-    // Evidence: WO-002-AC04 — projection lies on ellipse (within tolerance).
+    // Evidence: WO-002-AC03 — degenerate axes rejected; NaN/Inf rejected at
+    // the deserialization canonical-model boundary.
+    // Evidence: WO-002-AC04 — projection lies on ellipse (within approximate
+    // epsilon; Newton iteration + grid fallback).
     use super::*;
     use crate::line::Line2;
     use crate::ops::{Bounded2, Intersect2, Intersection2, Transformable2, Validate};
@@ -455,6 +523,15 @@ mod tests {
 
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
+    }
+
+    /// Loose on-curve check for approximate projection results.
+    /// Uses a 1e-6 absolute epsilon on the implicit value scaled by the
+    /// larger semi-axis. This is a TEST helper, not a predicate-tolerance
+    /// policy.
+    fn on_curve_loose(e: &Ellipse2, p: &Point2) -> bool {
+        let scale = e.radii.x.max(e.radii.y);
+        e.implicit_value(p).abs() * scale < 1e-6
     }
 
     #[test]
@@ -485,8 +562,9 @@ mod tests {
     }
 
     #[test]
-    fn project_point_lies_on_ellipse() {
-        // Evidence: WO-002-AC04 — projection lies on primitive.
+    fn project_point_approx_lies_on_ellipse() {
+        // Evidence: WO-002-AC04 — approximate projection (Newton + grid
+        // fallback) lies near the primitive within a small epsilon.
         let e = Ellipse2::new(
             Point2::new(1.0, 1.0).unwrap(),
             Vector2::new(2.0, 1.0).unwrap(),
@@ -495,9 +573,9 @@ mod tests {
         .unwrap();
         for t in [0.0, 1.0, 2.0, 3.0, 4.0, 5.0] {
             let p = e.point_at_angle(t);
-            let proj = e.project_point(&p);
+            let proj = e.project_point_approx(&p);
             assert!(
-                e.contains_point(&proj, Tolerance::new(1e-6).unwrap()),
+                on_curve_loose(&e, &proj),
                 "projected point not on ellipse at angle {t}: {proj:?}"
             );
         }
@@ -511,7 +589,7 @@ mod tests {
             Point2::new(5.0, 0.0).unwrap(),
         )
         .unwrap();
-        match e.intersect(&l, Tolerance::DEFAULT) {
+        match e.intersect(&l) {
             Intersection2::Points(ps) => {
                 assert_eq!(ps.len(), 2);
                 for p in &ps {
@@ -586,9 +664,7 @@ mod tests {
             0.5,
         )
         .unwrap();
-        let t = e
-            .transform(&Transform2D::identity(), Tolerance::DEFAULT)
-            .unwrap();
+        let t = e.transform(&Transform2D::identity()).unwrap();
         assert!(approx(t.center.x, 1.0));
         assert!(approx(t.center.y, 2.0));
         // For identity, the radii and rotation are preserved (the
@@ -596,7 +672,7 @@ mod tests {
         // pair — the ellipse AS A SET is identical; check via sampling).
         for ang in [0.0, 1.0, 2.0, 3.0, 5.0] {
             let p = e.point_at_angle(ang);
-            assert!(t.contains_point(&p, Tolerance::new(1e-6).unwrap()));
+            assert!(on_curve_loose(&t, &p));
         }
     }
 
@@ -611,14 +687,13 @@ mod tests {
         )
         .unwrap();
         let t = Transform2D::new(Vector2::new(1.0, 1.0).unwrap(), 0.5, 2.0, 2.0).unwrap();
-        let img = e.transform(&t, Tolerance::DEFAULT).unwrap();
-        let loose = Tolerance::new(1e-6).unwrap();
+        let img = e.transform(&t).unwrap();
         for i in 0..32 {
             let ang = (i as f64) * std::f64::consts::TAU / 32.0;
             let p = e.point_at_angle(ang);
             let tp = t.apply_point(&p);
             assert!(
-                img.contains_point(&tp, loose),
+                on_curve_loose(&img, &tp),
                 "transformed point {tp:?} not on image ellipse {img:?} (ang={ang})"
             );
         }
@@ -633,19 +708,18 @@ mod tests {
         // that the image ellipse AS A SET is correct.
         let e = Ellipse2::new(Point2::ORIGIN, Vector2::new(2.0, 3.0).unwrap(), 0.0).unwrap();
         let t = Transform2D::scaling(2.0, 5.0);
-        let img = e.transform(&t, Tolerance::DEFAULT).unwrap();
+        let img = e.transform(&t).unwrap();
         // The image should have semi-axes 4 and 15 (in some order/rotation).
         let big = img.radii.x.max(img.radii.y);
         let small = img.radii.x.min(img.radii.y);
         assert!(approx(big, 15.0));
         assert!(approx(small, 4.0));
         // Verify by sampling that transformed curve points lie on the image.
-        let loose = Tolerance::new(1e-6).unwrap();
         for i in 0..32 {
             let ang = (i as f64) * std::f64::consts::TAU / 32.0;
             let p = e.point_at_angle(ang);
             let tp = t.apply_point(&p);
-            assert!(img.contains_point(&tp, loose));
+            assert!(on_curve_loose(&img, &tp));
         }
     }
 
@@ -655,7 +729,7 @@ mod tests {
         // to a line/point; explicitly rejected.
         let e = Ellipse2::new(Point2::ORIGIN, Vector2::new(2.0, 1.0).unwrap(), 0.0).unwrap();
         let t = Transform2D::scaling(0.0, 1.0);
-        let err = e.transform(&t, Tolerance::DEFAULT).unwrap_err();
+        let err = e.transform(&t).unwrap_err();
         assert!(matches!(err, GeometryError::Degenerate(_)));
     }
 
@@ -672,14 +746,13 @@ mod tests {
         )
         .unwrap();
         let t = Transform2D::new(Vector2::ZERO, 0.5, 2.0, 3.0).unwrap();
-        let img = e.transform(&t, Tolerance::DEFAULT).unwrap();
-        let loose = Tolerance::new(1e-6).unwrap();
+        let img = e.transform(&t).unwrap();
         for i in 0..32 {
             let ang = (i as f64) * std::f64::consts::TAU / 32.0;
             let p = e.point_at_angle(ang);
             let tp = t.apply_point(&p);
             assert!(
-                img.contains_point(&tp, loose),
+                on_curve_loose(&img, &tp),
                 "transformed point {tp:?} not on image ellipse {img:?} (ang={ang})"
             );
         }
@@ -687,6 +760,9 @@ mod tests {
 
     #[test]
     fn validate_rejects_deserialized_zero_axis() {
+        // Direct struct-literal construction (test-only path; not a
+        // canonical-model boundary) can still produce a zero-axis value;
+        // `validate()` is the explicit check for such values.
         let bad = Ellipse2 {
             center: Point2::ORIGIN,
             radii: Vector2::new_unchecked(0.0, 1.0),

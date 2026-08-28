@@ -10,17 +10,56 @@ use crate::ops::{Bounded2, Contains2, DistanceTo2, Project2, Transformable2, Val
 use crate::tolerance::Tolerance;
 use crate::transform::Transform2D;
 use crate::vector::Vector2;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Serialize,
+    de::{self, Deserializer},
+};
 
 /// A 2D point with finite `f64` coordinates. NaN/Inf are rejected at
-/// construction; deserialized points MUST be [`Validate::validate`]d at
-/// canonical-model boundaries.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// construction and at the `Deserialize` canonical-model boundary
+/// (via the private `RawPoint2` shadow + `TryFrom` + `Validate`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Point2 {
     /// X coordinate.
     pub x: f64,
     /// Y coordinate.
     pub y: f64,
+}
+
+// ---------------------------------------------------------------------------
+// Canonical-model boundary: Deserialize delegates to a private Raw shadow
+// and then calls `Validate`, so non-finite values are rejected at the
+// deserialization boundary (per spec/domain-model.md §"Core value types
+// and invariants").
+// ---------------------------------------------------------------------------
+
+/// Private shadow struct used as the serde wire shape for [`Point2`].
+/// Carries the raw (unvalidated) field values from the deserializer; the
+/// `TryFrom` impl on `Point2` enforces the finiteness invariant.
+#[derive(Deserialize)]
+struct RawPoint2 {
+    x: f64,
+    y: f64,
+}
+
+impl TryFrom<RawPoint2> for Point2 {
+    type Error = GeometryError;
+
+    fn try_from(r: RawPoint2) -> Result<Self, Self::Error> {
+        let p = Self { x: r.x, y: r.y };
+        p.validate()?;
+        Ok(p)
+    }
+}
+
+impl<'de> Deserialize<'de> for Point2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawPoint2::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(de::Error::custom)
+    }
 }
 
 impl Point2 {
@@ -118,7 +157,7 @@ impl Bounded2 for Point2 {
 }
 
 impl Transformable2 for Point2 {
-    fn transform(&self, transform: &Transform2D, _tol: Tolerance) -> Result<Self, GeometryError> {
+    fn transform(&self, transform: &Transform2D) -> Result<Self, GeometryError> {
         // The image of a point under an affine transform is always a point.
         Ok(transform.apply_point(self))
     }
@@ -132,15 +171,17 @@ impl DistanceTo2<Point2> for Point2 {
 
 impl Project2 for Point2 {
     /// Projecting a point onto a point returns the point itself.
-    fn project_point(&self, _point: &Point2, _tol: Tolerance) -> Point2 {
+    fn project_point(&self, _point: &Point2) -> Point2 {
         *self
     }
 }
 
 impl Contains2<Point2> for Point2 {
-    /// A point "contains" another point iff they are coincident within `tol`.
-    fn contains(&self, rhs: &Point2, tol: Tolerance) -> bool {
-        self.distance_squared_to(*rhs) <= tol.coincident_squared()
+    /// A point "contains" another point iff they are coincident within
+    /// the canonical tolerance policy
+    /// ([`Tolerance::CANONICAL`](crate::tolerance::Tolerance::CANONICAL)).
+    fn contains(&self, rhs: &Point2) -> bool {
+        self.distance_squared_to(*rhs) <= Tolerance::CANONICAL.coincident_squared()
     }
 }
 
@@ -148,7 +189,8 @@ impl Contains2<Point2> for Point2 {
 mod tests {
     // Evidence: WO-002-AC01 — Point2 serde round-trip.
     // Evidence: WO-002-AC02 — distance to point determinism.
-    // Evidence: WO-002-AC03 — NaN/Inf rejection at construction.
+    // Evidence: WO-002-AC03 — NaN/Inf rejection at construction AND at the
+    // deserialization canonical-model boundary.
     // Evidence: WO-002-AC04 — distance symmetry (in lib property tests).
     use super::*;
     use crate::ops::{Bounded2, Contains2, Project2, Transformable2, Validate};
@@ -168,7 +210,8 @@ mod tests {
 
     #[test]
     fn validate_rejects_serde_deserialized_nan() {
-        // Deserialized points MUST be validate()d at canonical boundaries.
+        // Direct struct-literal construction (test-only path) can still
+        // produce a non-finite value; `validate()` is the explicit check.
         let p = Point2 {
             x: f64::NAN,
             y: 1.0,
@@ -197,7 +240,7 @@ mod tests {
         // Evidence: WO-002-AC04 — transform identity invariance.
         let p = Point2::new(1.5, -2.5).unwrap();
         let id = Transform2D::identity();
-        let q = p.transform(&id, Tolerance::DEFAULT).unwrap();
+        let q = p.transform(&id).unwrap();
         assert!(approx(q.x, p.x));
         assert!(approx(q.y, p.y));
     }
@@ -206,16 +249,16 @@ mod tests {
     fn project_onto_self_returns_self() {
         let p = Point2::new(1.0, 1.0).unwrap();
         let q = Point2::new(2.0, 5.0).unwrap();
-        assert_eq!(p.project_point(&q, Tolerance::DEFAULT), p);
+        assert_eq!(p.project_point(&q), p);
     }
 
     #[test]
     fn contains_coincident_point() {
         let p = Point2::new(1.0, 2.0).unwrap();
         let q = Point2::new(1.0 + 1e-12, 2.0 - 1e-12).unwrap();
-        assert!(p.contains(&q, Tolerance::DEFAULT));
+        assert!(p.contains(&q));
         let r = Point2::new(1.0 + 1e-3, 2.0).unwrap();
-        assert!(!p.contains(&r, Tolerance::DEFAULT));
+        assert!(!p.contains(&r));
     }
 
     #[test]

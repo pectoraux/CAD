@@ -3,22 +3,36 @@
 //! Provides a stable NURBS representation per the frozen v1.1 domain model
 //! (`Spline` entity in `spec/domain-model.md`).
 //!
-//! Out-of-scope per W002: exact spline-spline intersection, exact
-//! closest-point evaluation. Distance/projection here are sampling-based
-//! with a deterministic fixed sample count and DOCUMENTED as approximate;
-//! exact evaluation is a future refinement.
+//! Per the frozen v1.1 contract, this module distinguishes EXACT from
+//! APPROXIMATE operations on `Spline2`:
+//! - **EXACT**: evaluation (Cox–de Boor), bounding box (convex-hull of
+//!   control points), transform (affine image of control points — rational
+//!   NURBS is affinely invariant), validate (knot multiplicity, weights,
+//!   finiteness).
+//! - **APPROXIMATE**: closest-point projection (deterministic sampling +
+//!   local refine), distance (delegates to approximate projection). These
+//!   are exposed via the [`ApproximateProject2`] /
+//!   [`ApproximateDistanceTo2`] traits and `_approx` inherent method
+//!   names so callers cannot silently use an approximate result where an
+//!   exact result is required.
+//!
+//! Out-of-scope per W002: exact spline-spline / spline-curve intersection.
+//! These would require inventing semantics not specified by the frozen
+//! contracts; deferred to a later refinement.
 
 use crate::bbox::BoundingBox2;
 use crate::error::GeometryError;
-use crate::ops::{Bounded2, DistanceTo2, Project2, Transformable2, Validate};
+use crate::ops::{ApproximateDistanceTo2, ApproximateProject2, Bounded2, Transformable2, Validate};
 use crate::point::Point2;
-use crate::tolerance::Tolerance;
 use crate::transform::Transform2D;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Serialize,
+    de::{self, Deserializer},
+};
 
 /// A 2D NURBS spline: degree, control points, knot vector, optional
 /// rational weights.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Spline2 {
     /// Polynomial degree (≥ 1).
     pub degree: u32,
@@ -28,6 +42,33 @@ pub struct Spline2 {
     pub knots: Vec<f64>,
     /// Optional rational weights (same length as control points; all > 0).
     pub weights: Option<Vec<f64>>,
+}
+
+/// Private shadow struct used as the serde wire shape for [`Spline2`].
+#[derive(Deserialize)]
+struct RawSpline2 {
+    degree: u32,
+    control_points: Vec<Point2>,
+    knots: Vec<f64>,
+    weights: Option<Vec<f64>>,
+}
+
+impl TryFrom<RawSpline2> for Spline2 {
+    type Error = GeometryError;
+
+    fn try_from(r: RawSpline2) -> Result<Self, Self::Error> {
+        Self::new(r.degree, r.control_points, r.knots, r.weights)
+    }
+}
+
+impl<'de> Deserialize<'de> for Spline2 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawSpline2::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(de::Error::custom)
+    }
 }
 
 impl Spline2 {
@@ -231,6 +272,16 @@ impl Spline2 {
 
     /// Evaluate the spline at parameter `u` via Cox–de Boor. Clamps `u` to
     /// the spline's parametric domain.
+    ///
+    /// EXACT algebraic evaluation (Cox–de Boor recurrence). The only
+    /// non-exact case is a degenerate parameter where the basis-function
+    /// weighted sum collapses to zero (ill-formed spline); in that case,
+    /// this method returns the first control point as a DOCUMENTED
+    /// degenerate-case fallback (not an approximation in the
+    /// sampling/iterative sense — it is an exact algebraic evaluation
+    /// with a deterministic fallback for the degenerate case). Callers
+    /// that need a strictly non-degenerate result should pre-validate the
+    /// parameter.
     #[must_use]
     pub fn evaluate(&self, u: f64) -> Point2 {
         let lo = self.domain_min();
@@ -252,16 +303,27 @@ impl Spline2 {
             sum_w += bw;
         }
         if sum_w == 0.0 {
-            // Degenerate fallback to the first control point.
+            // Degenerate fallback (DOCUMENTED): basis-function weighted sum
+            // collapsed to zero (ill-formed spline at this parameter).
+            // Return the first control point as a deterministic fallback
+            // rather than producing NaN. This is the same behavior the
+            // previous version had, but now explicitly documented as a
+            // degenerate-case fallback rather than an approximation.
             return self.control_points[0];
         }
         Point2::new_unchecked(sum_x / sum_w, sum_y / sum_w)
     }
 
-    /// Closest point on the spline to `p` via deterministic sampling
-    /// (64 samples + local refine). Documented as approximate.
+    /// APPROXIMATE closest point on the spline to `p` via deterministic
+    /// sampling (64 samples + 8 local-refine iterations). Documented as
+    /// approximate; exact closest-point on a NURBS is quartic / iterative
+    /// and is deferred to a later refinement per W002 scope.
+    ///
+    /// Exposed via the [`ApproximateProject2`] trait and the `_approx`
+    /// inherent method name so callers cannot silently use an approximate
+    /// result where an exact result is required.
     #[must_use]
-    pub fn project_point(&self, p: &Point2) -> Point2 {
+    pub fn project_point_approx(&self, p: &Point2) -> Point2 {
         const N: usize = 64;
         let lo = self.domain_min();
         let hi = self.domain_max();
@@ -298,10 +360,12 @@ impl Spline2 {
         self.evaluate(best_u)
     }
 
-    /// Distance from `p` to the spline curve (sampling-based, approximate).
+    /// APPROXIMATE distance from `p` to the spline curve. Delegates to
+    /// [`Self::project_point_approx`]; the result may differ from the true
+    /// distance by a small epsilon.
     #[must_use]
-    pub fn distance_to_point(&self, p: &Point2) -> f64 {
-        self.project_point(p).distance_to(*p)
+    pub fn distance_to_point_approx(&self, p: &Point2) -> f64 {
+        self.project_point_approx(p).distance_to(*p)
     }
 
     /// Convex-hull-of-control-points bounding box (conservative — the spline
@@ -390,7 +454,7 @@ impl Transformable2 for Spline2 {
     /// Affine-transform the control points; weights are unchanged (rational
     /// NURBS is affinely invariant under transformation of control points).
     /// Always representable — returns `Ok`.
-    fn transform(&self, transform: &Transform2D, _tol: Tolerance) -> Result<Self, GeometryError> {
+    fn transform(&self, transform: &Transform2D) -> Result<Self, GeometryError> {
         let control_points = self
             .control_points
             .iter()
@@ -405,36 +469,41 @@ impl Transformable2 for Spline2 {
     }
 }
 
-impl DistanceTo2<Point2> for Spline2 {
-    fn distance_to(&self, rhs: &Point2) -> f64 {
-        self.distance_to_point(rhs)
+impl ApproximateDistanceTo2<Point2> for Spline2 {
+    /// APPROXIMATE distance from `self` to `rhs`. Delegates to
+    /// [`Spline2::project_point_approx`]; the result may differ from the
+    /// true distance by a small epsilon.
+    fn distance_to_approx(&self, rhs: &Point2) -> f64 {
+        self.distance_to_point_approx(rhs)
     }
 }
 
-impl Project2 for Spline2 {
-    fn project_point(&self, point: &Point2, _tol: Tolerance) -> Point2 {
-        // Spline closest-point uses deterministic fixed-count sampling
-        // (no tolerance-gated classification); the `tol` parameter is
-        // accepted for trait-signature consistency and ignored.
-        self.project_point(point)
+impl ApproximateProject2 for Spline2 {
+    /// APPROXIMATE closest point. See [`Spline2::project_point_approx`] for
+    /// the approximation strategy and deterministic sample/iteration count.
+    fn project_point_approx(&self, point: &Point2) -> Point2 {
+        self.project_point_approx(point)
     }
 }
 
-// NOTE: Intersect2 and Contains2 for Spline2 are intentionally NOT
-// implemented per W002 scope (spline intersection is not specified by the
-// frozen contracts; deferred to a later refinement).
+// NOTE: Intersect2, Contains2, Project2, DistanceTo2 (the EXACT traits) are
+// intentionally NOT implemented for Spline2 per W002 scope (exact
+// spline-curve closest-point and spline-spline intersection are not
+// specified by the frozen contracts; deferred to a later refinement).
+// Approximate closest-point / distance are exposed via the
+// `ApproximateProject2` / `ApproximateDistanceTo2` traits.
 
 #[cfg(test)]
 mod tests {
     // Evidence: WO-002-AC01 — Spline2 serde round-trip.
     // Evidence: WO-002-AC03 — knot multiplicity > degree+1 rejected;
     // insufficient control points rejected; non-monotonic knots rejected;
-    // weight mismatch rejected; zero-degree rejected.
+    // weight mismatch rejected; zero-degree rejected; NaN/Inf rejected at
+    // the deserialization canonical-model boundary.
     use super::*;
     use crate::ops::{Bounded2, Transformable2, Validate};
     use crate::point::Point2;
     use crate::testutil::roundtrip;
-    use crate::tolerance::Tolerance;
     use crate::transform::Transform2D;
 
     fn approx(a: f64, b: f64) -> bool {
@@ -555,8 +624,9 @@ mod tests {
     }
 
     #[test]
-    fn project_point_lies_near_curve() {
-        // Evidence: WO-002-AC04 — projection (sampling) lies near primitive.
+    fn project_point_approx_lies_near_curve() {
+        // Evidence: WO-002-AC04 — approximate projection (sampling + refine)
+        // lies near the primitive.
         let pts = [
             Point2::new(0.0, 0.0).unwrap(),
             Point2::new(1.0, 2.0).unwrap(),
@@ -566,7 +636,7 @@ mod tests {
         let s = cubic_bezier(pts);
         // Project the curve's own midpoint (u=0.5).
         let mid = s.evaluate(0.5);
-        let proj = s.project_point(&mid);
+        let proj = s.project_point_approx(&mid);
         assert!(proj.distance_to(mid) < 1e-6);
     }
 
@@ -580,9 +650,7 @@ mod tests {
             Point2::new(3.0, 0.0).unwrap(),
         ];
         let s = cubic_bezier(pts);
-        let st = s
-            .transform(&Transform2D::identity(), Tolerance::DEFAULT)
-            .unwrap();
+        let st = s.transform(&Transform2D::identity()).unwrap();
         let p = s.evaluate(0.5);
         let q = st.evaluate(0.5);
         assert!(approx(p.x, q.x));
@@ -607,6 +675,9 @@ mod tests {
 
     #[test]
     fn validate_rejects_deserialized_bad_knots() {
+        // Direct struct-literal construction (test-only path; not a
+        // canonical-model boundary) can still produce a non-monotonic
+        // knot vector; `validate()` is the explicit check for such values.
         let bad = Spline2 {
             degree: 3,
             control_points: vec![
