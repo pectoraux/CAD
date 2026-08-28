@@ -39,7 +39,6 @@ for line in spec.splitlines():
 if set(deps) != required:
     raise SystemExit("WORK_ORDER_STATE_GATE_FAIL work-item set mismatch")
 
-# A work item cannot become VERIFIED before every dependency is VERIFIED.
 for wid in verified:
     missing = deps[wid] - verified
     if missing:
@@ -59,17 +58,18 @@ if active is not None:
     if checkpoint_state.get(cp) != "OPEN":
         raise SystemExit(f"WORK_ORDER_STATE_GATE_FAIL {active} checkpoint {cp} is not OPEN")
 
-# Frozen Work Orders contain their initial planning status. Mutable lifecycle
-# state lives here so implementation can progress without editing frozen files.
 ready = []
 for i in range(1, 27):
     text = Path(f"docs/work-orders/WORK-{i:03d}.md").read_text()
     if re.search(r"^Status:\s*READY\s*$", text, re.MULTILINE):
         ready.append(f"W{i:03d}")
-if active is None and len(ready) != 1:
-    raise SystemExit(f"WORK_ORDER_STATE_GATE_FAIL expected exactly one initial READY work item, found: {ready}")
-if active is None and ready[0] in verified:
-    raise SystemExit("WORK_ORDER_STATE_GATE_FAIL initial READY item cannot already be verified")
+
+if active is None and not verified:
+    if len(ready) != 1:
+        raise SystemExit(f"WORK_ORDER_STATE_GATE_FAIL expected exactly one initial READY work item, found: {ready}")
+
+if active is None and verified and checkpoint_state.get("CP0") != "PASSED":
+    raise SystemExit("WORK_ORDER_STATE_GATE_FAIL verified idle state requires CP0=PASSED")
 
 print("WORK_ORDER_STATE_GATE_PASS")
 PY
