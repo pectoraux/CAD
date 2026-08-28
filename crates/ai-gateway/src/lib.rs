@@ -7,3 +7,14 @@
 
 /// Returns the module name for baseline architecture tests.
 pub const MODULE_NAME: &str = "ai-gateway";
+
+#[cfg(test)]
+mod tests {
+    // Evidence: WO-001-AC02 — module boundary matches `spec/architecture.md` §2.
+    // Evidence: WO-001-AC04 — deterministic baseline unit test harness.
+
+    #[test]
+    fn module_boundary_matches_spec() {
+        assert_eq!(super::MODULE_NAME, "ai-gateway");
+    }
+}

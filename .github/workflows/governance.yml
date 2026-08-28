@@ -1,1 +1,20 @@
-name: Governance\n\non:\n  pull_request:\n  push:\n    branches: [main]\n\njobs:\n  governance:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          fetch-depth: 0\n      - name: Verify frozen specification\n        run: |\n          if [ -n "${{ github.event.pull_request.base.sha }}" ]; then BASE_SHA="${{ github.event.pull_request.base.sha }}" ./scripts/frozen-spec-gate.sh; else ./scripts/frozen-spec-gate.sh; fi\n      - name: Verify specification and work-order contracts\n        run: ./scripts/spec-gate.sh\n
+name: Governance
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  governance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify frozen specification
+        run: |
+          if [ -n "${{ github.event.pull_request.base.sha }}" ]; then BASE_SHA="${{ github.event.pull_request.base.sha }}" ./scripts/frozen-spec-gate.sh; else ./scripts/frozen-spec-gate.sh; fi
+      - name: Verify specification and work-order contracts
+        run: ./scripts/spec-gate.sh
