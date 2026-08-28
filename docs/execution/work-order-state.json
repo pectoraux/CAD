@@ -1,11 +1,11 @@
 {
   "schema_version": "1.0",
   "authority": "execution-state-only",
-  "active_work_order": null,
-  "verified_work_items": ["W001"],
+  "active_work_order": "W001",
+  "verified_work_items": [],
   "checkpoints": {
-    "CP0": "PASSED",
-    "CP1": "OPEN",
+    "CP0": "OPEN",
+    "CP1": "BLOCKED",
     "CP2": "BLOCKED",
     "CP3": "BLOCKED",
     "CP4": "BLOCKED",
