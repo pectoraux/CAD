@@ -6,6 +6,7 @@ required=(
   spec/architecture-lock.md
   spec/domain-model.md
   spec/commands.md
+  spec/api.md
   spec/interoperability.md
   spec/requirements.md
   spec/dependency-graph.md
