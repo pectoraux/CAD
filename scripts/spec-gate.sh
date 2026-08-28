@@ -30,7 +30,10 @@ done
 grep -q 'Status: FROZEN' spec/architecture-lock.md || { echo 'SPEC_GATE_FAIL architecture not frozen'; exit 1; }
 grep -q 'Rust stable' spec/architecture-lock.md || { echo 'SPEC_GATE_FAIL Rust lock missing'; exit 1; }
 grep -q 'GLM 5.3' docs/ARCHITECT-MASTER-PROMPT.md || { echo 'SPEC_GATE_FAIL GLM contract missing'; exit 1; }
-./scripts/verify-work-orders.sh
-./scripts/verify-dependencies.sh
+
+bash ./scripts/verify-work-orders.sh
+bash ./scripts/verify-dependencies.sh
+bash ./scripts/verify-architecture-dependencies.sh
+bash ./scripts/verify-work-order-state.sh
 
 echo 'SPEC_GATE_PASS'
