@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0",
   "authority": "execution-state-only",
-  "active_work_order": null,
+  "active_work_order": "W001",
   "verified_work_items": [],
   "checkpoints": {
     "CP0": "OPEN",
